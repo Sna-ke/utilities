@@ -23,6 +23,7 @@ running the host day to day.
 | Swap | 4 GB on machines under 10 GB of RAM |
 | Clean-up | Weekly `docker system prune` (`/etc/cron.weekly/docker-prune`), logged to the journal |
 | Runners | Latest release, SHA-256 checked, one systemd service each, as the `runner` user |
+| Tool locations | Each runner's `.env` tells setup actions where to install tools (see below). Existing runners get it too |
 | `ghrunner` | `/usr/local/bin/ghrunner`, with its shared code in `/usr/local/lib/ghrunner/` |
 
 ## Sizing
@@ -77,7 +78,7 @@ A host set up before `ghrunner` existed gets it, and the clean-up job's journal 
 | `ghrunner status` | Each runner: service state, idle or busy, and the job it is running | No |
 | `ghrunner stats [days]` | From the journal, for the last 7 days or `days`: jobs started and completed, results and average time, per runner and per repository. Then disk use of `/` and Docker, memory, swap, the last clean-up and the last reboot | No |
 | `ghrunner prune` | Runs the weekly clean-up now and shows the space freed | Yes |
-| `ghrunner doctor` | Checks disk (warn under 20% free, fail under 10%), Docker, every runner service, the clean-up job, the firewall, SSH keys only, a pending reboot and swap. Prints PASS/WARN/FAIL and exits 1 on any FAIL | No |
+| `ghrunner doctor` | Checks disk (warn under 20% free, fail under 10%), Docker, every runner service, tool locations, the clean-up job, the firewall, SSH keys only, a pending reboot and swap. Prints PASS/WARN/FAIL and exits 1 on any FAIL | No |
 | `ghrunner help` | Lists the commands | No |
 
 `<repo>` is a repository name (owner `GITHUB_OWNER`, default `Sna-ke`) or `owner/repo`. `add` and `delete` get
@@ -107,6 +108,26 @@ has it). Docker disk use needs sudo or the `docker` group.
 3. Delete the old VM.
 
 Runner names include the VM's hostname, so old and new never clash.
+
+## Where jobs install tools
+
+Setup actions are written for GitHub's own runners, where system folders are writable. On this host they run as
+the `runner` user, so each runner's `.env` file (read by the runner when it starts, passed to every job) points
+them somewhere writable. Workflows need no changes.
+
+| Setting | Value | Why |
+| --- | --- | --- |
+| `DOTNET_INSTALL_DIR` | `/home/runner/<runner>/.dotnet` | `actions/setup-dotnet` installs to `/usr/share/dotnet` by default. One folder per runner, so two jobs never install into the same one |
+| `AGENT_TOOLSDIRECTORY`, `RUNNER_TOOL_CACHE` | `/opt/hostedtoolcache`, owned by `runner` | GitHub's prebuilt Python (`setup-python`) and Ruby (`setup-ruby`) only work from this path. Shared by all runners; `setup-node`, `setup-java` and `setup-go` use it too |
+
+`setup-runner.sh` and `ghrunner add` apply these to every runner and restart the ones whose settings changed. A
+runner in the middle of a job is left alone, with the command to restart it afterwards. `ghrunner doctor` reports
+any runner without them.
+
+| Other setup actions | On this host |
+| --- | --- |
+| `shivammathur/setup-php` | Installs PHP system-wide with apt and sudo, which the `runner` user has. Two jobs wanting different PHP versions at the same time would clash |
+| Anything else | If a job fails with "Permission denied", look in the action's README for an install-folder setting, and add it to `runner_env_settings` in `runner-lib.sh` |
 
 ## Testing
 

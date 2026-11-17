@@ -7,6 +7,8 @@
 #   - runner names are <hostname>-<repo-lowercase>-<n>
 #   - labels are <repo>-ci, plus <repo>-stack on runner 1 when the machine has 6 GB of RAM or more
 #   - each runner's .runner file holds gitHubUrl; its systemd unit is actions.runner.*
+#   - each runner's .env file sets where tools install (runner_env_settings), because the setup actions
+#     assume GitHub's own runner image, where system folders are writable
 #
 # Secrets: none. GITHUB_TOKEN is read from the environment and never written to disk.
 
@@ -22,6 +24,7 @@ DOWNLOAD_DIR="/var/cache/actions-runner"
 PRUNE_SCRIPT="/etc/cron.weekly/docker-prune"
 # shellcheck disable=SC2034 # read by the scripts that source this file
 GHRUNNER_LIB_DIR="/usr/local/lib/ghrunner"
+TOOL_CACHE_DIR="/opt/hostedtoolcache"
 
 # Prints a step heading, so long runs show where they are.
 log() { printf '\n==> %s\n' "$*"; }
@@ -107,6 +110,114 @@ runner_repository() {
 }
 
 # ---------------------------------------------------------------------------------------------
+# Busy runners
+# ---------------------------------------------------------------------------------------------
+
+# Prints the actions.runner.* unit named in a /proc/<pid>/cgroup file read from stdin.
+unit_from_cgroup() {
+  grep -m 1 -oE 'actions\.runner\.[^/]*\.service'
+}
+
+# True when <unit> is one of the lines of <list> (e.g. the busy units).
+unit_in_list() {
+  [[ -n $1 ]] && grep -qxF -- "$1" <<<"$2"
+}
+
+# Prints the unit of every runner with a Runner.Worker process, i.e. a job in progress. The worker runs
+# inside its runner's service, so its cgroup, which any user can read, names the runner.
+busy_units() {
+  local pid
+  while read -r pid; do
+    unit_from_cgroup 2>/dev/null <"/proc/${pid}/cgroup" || true
+  done < <(pgrep -x Runner.Worker || true) | sort -u
+}
+
+# ---------------------------------------------------------------------------------------------
+# Where jobs install tools (each runner's .env file)
+# ---------------------------------------------------------------------------------------------
+
+# Prints the settings every runner's .env file gets. The runner reads .env when it starts and passes the
+# values to every job, so workflows need no changes.
+#   DOTNET_INSTALL_DIR   actions/setup-dotnet installs to /usr/share/dotnet by default, which the runner
+#                        user can't write. One folder per runner, so two jobs never install into the same one.
+#   AGENT_TOOLSDIRECTORY, RUNNER_TOOL_CACHE
+#                        the tool cache. GitHub's prebuilt Python (setup-python) and Ruby (setup-ruby) only
+#                        work from /opt/hostedtoolcache, the path they were built in. Shared by all runners.
+runner_env_settings() {
+  printf 'DOTNET_INSTALL_DIR=%s/.dotnet\n' "$1"
+  printf 'AGENT_TOOLSDIRECTORY=%s\n' "${TOOL_CACHE_DIR}"
+  printf 'RUNNER_TOOL_CACHE=%s\n' "${TOOL_CACHE_DIR}"
+}
+
+# Merges KEY=value settings (the arguments) into .env text read from stdin: replaces lines with the same
+# key, appends missing settings, and keeps every other line (config.sh writes LANG and similar there).
+merge_env() {
+  local line key
+  local -A wanted=() written=()
+  local -a keys=()
+  for line in "$@"; do
+    key="${line%%=*}"
+    wanted["${key}"]="${line}"
+    keys+=("${key}")
+  done
+  while IFS= read -r line || [[ -n ${line} ]]; do
+    key="${line%%=*}"
+    if [[ -z ${key} || -z ${wanted[${key}]+set} ]]; then
+      printf '%s\n' "${line}"
+    elif [[ -z ${written[${key}]+set} ]]; then
+      printf '%s\n' "${wanted[${key}]}"
+      written["${key}"]=1
+    fi
+  done
+  for key in "${keys[@]}"; do
+    if [[ -z ${written[${key}]+set} ]]; then printf '%s\n' "${wanted[${key}]}"; fi
+  done
+}
+
+# Writes the settings into a runner's .env file, owned by the runner user. Succeeds only when the file
+# changed, so callers know the runner needs a restart to read it.
+write_runner_env() {
+  local directory="$1" file="$1/.env" current="" updated
+  local -a env_settings
+  mapfile -t env_settings < <(runner_env_settings "${directory}")
+  if [[ -f ${file} ]]; then current="$(<"${file}")"; fi
+  updated="$(printf '%s' "${current}" | merge_env "${env_settings[@]}")"
+  [[ ${updated} != "${current}" ]] || return 1
+  printf '%s\n' "${updated}" >"${file}.new"
+  chown "${RUNNER_USER}:${RUNNER_USER}" "${file}.new"
+  mv "${file}.new" "${file}"
+}
+
+# Creates the shared tool cache, owned by the runner user. Safe to repeat.
+prepare_tool_cache() {
+  install -d -o "${RUNNER_USER}" -g "${RUNNER_USER}" "${TOOL_CACHE_DIR}"
+}
+
+# Brings every runner on this machine up to date with runner_env_settings, restarting a runner whose
+# .env changed so it reads it. A runner in the middle of a job is left running (a restart would cancel
+# the job), with the command to restart it later.
+configure_runners() {
+  local directory unit busy
+  prepare_tool_cache
+  busy="$(busy_units)"
+  for directory in "${RUNNER_HOME}"/*/; do
+    directory="${directory%/}"
+    [[ -f ${directory}/.runner ]] || continue
+    write_runner_env "${directory}" || continue
+    unit=""
+    if [[ -f ${directory}/.service ]]; then unit="$(<"${directory}/.service")"; fi
+    if [[ -z ${unit} ]]; then
+      note "${directory##*/}: settings updated"
+    elif unit_in_list "${unit}" "${busy}"; then
+      note "${directory##*/}: settings updated; it is running a job, so restart it afterwards: sudo systemctl restart ${unit}"
+    else
+      systemctl restart "${unit}"
+      note "${directory##*/}: settings updated and runner restarted"
+    fi
+  done
+}
+
+# ---------------------------------------------------------------------------------------------
 # Download, register, unregister
 # ---------------------------------------------------------------------------------------------
 
@@ -164,8 +275,9 @@ runner_token() {
   echo "${token}"
 }
 
-# Installs, registers and starts runner number <index> for one repository ("owner/repo"). Skips a runner
-# that is already registered, so running it again only adds what is missing.
+# Installs, registers and starts runner number <index> for one repository ("owner/repo"), with its .env
+# settings in place before it first starts. Skips a runner that is already registered, so running it
+# again only adds what is missing.
 install_runner() {
   local full="$1" index="$2" archive="$3"
   local slug directory name labels token
@@ -189,6 +301,8 @@ install_runner() {
   (cd "${directory}" && sudo -u "${RUNNER_USER}" ./config.sh --unattended --replace \
     --url "https://github.com/${full}" --token "${token}" \
     --name "${name}" --labels "${labels}" --work _work)
+  prepare_tool_cache
+  write_runner_env "${directory}" || true
   (cd "${directory}" && ./svc.sh install "${RUNNER_USER}" >/dev/null && ./svc.sh start >/dev/null)
   note "registered and running"
 }

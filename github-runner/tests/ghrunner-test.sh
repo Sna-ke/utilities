@@ -217,6 +217,51 @@ check "meminfo: missing key" "" "$(meminfo_bytes Nope "${SAMPLES}/meminfo")"
 check "human bytes" "1.5GiB" "$(human_bytes 1610612736)"
 
 # ---------------------------------------------------------------------------------------------
+# .env settings (where jobs install tools)
+# ---------------------------------------------------------------------------------------------
+
+RUNNER_USER="$(id -un)" # the tests write files as whoever runs them
+TOOL_CACHE_DIR="${SAMPLES}/hostedtoolcache"
+check "env settings" "DOTNET_INSTALL_DIR=/home/runner/groundcore-1/.dotnet
+AGENT_TOOLSDIRECTORY=${TOOL_CACHE_DIR}
+RUNNER_TOOL_CACHE=${TOOL_CACHE_DIR}" "$(runner_env_settings /home/runner/groundcore-1)"
+check "merge: empty file" $'A=1\nB=2' "$(printf '' | merge_env A=1 B=2)"
+check "merge: keeps other lines, replaces in place, appends the rest" $'LANG=C.UTF-8\nA=1\n\nJAVA_HOME=/x\nB=2' \
+  "$(printf 'LANG=C.UTF-8\nA=old\n\nJAVA_HOME=/x\nA=duplicate' | merge_env A=1 B=2)"
+check "merge: values with = signs" $'A=x=y' "$(printf 'A=1\n' | merge_env 'A=x=y')"
+
+mkdir -p "${SAMPLES}/home/idle-1" "${SAMPLES}/home/busy-1" "${SAMPLES}/home/done-1" "${SAMPLES}/home/new-1"
+for name in idle-1 busy-1 done-1 new-1; do
+  printf '{"gitHubUrl": "https://github.com/example-org/example-app"}' >"${SAMPLES}/home/${name}/.runner"
+done
+printf 'LANG=C.UTF-8\n' >"${SAMPLES}/home/idle-1/.env"
+printf 'actions.runner.example-org-example-app.vps-idle-1.service\n' >"${SAMPLES}/home/idle-1/.service"
+printf 'actions.runner.example-org-example-app.vps-busy-1.service\n' >"${SAMPLES}/home/busy-1/.service"
+runner_env_settings "${SAMPLES}/home/done-1" >"${SAMPLES}/home/done-1/.env"
+printf 'actions.runner.example-org-example-app.vps-done-1.service\n' >"${SAMPLES}/home/done-1/.service"
+check "write .env: changed" "ok" "$(outcome write_runner_env "${SAMPLES}/home/new-1")"
+check "write .env: unchanged the second time" "fails" "$(outcome write_runner_env "${SAMPLES}/home/new-1")"
+check "doctor finds runners without the settings" "busy-1,idle-1" \
+  "$(RUNNER_HOME="${SAMPLES}/home" runners_missing_settings)"
+
+RESTARTS="${SAMPLES}/restarts"
+# shellcheck disable=SC2317,SC2329 # stand-ins, called by the functions under test
+systemctl() { echo "$*" >>"${RESTARTS}"; }
+# shellcheck disable=SC2317,SC2329
+busy_units() { echo "actions.runner.example-org-example-app.vps-busy-1.service"; }
+check "configure runners: messages" "    busy-1: settings updated; it is running a job, so restart it afterwards: sudo systemctl restart actions.runner.example-org-example-app.vps-busy-1.service
+    idle-1: settings updated and runner restarted" "$(RUNNER_HOME="${SAMPLES}/home" configure_runners)"
+check "configure runners: only the idle, changed runner restarts" "restart actions.runner.example-org-example-app.vps-idle-1.service" \
+  "$(cat "${RESTARTS}")"
+check "configure runners: other .env lines kept" "LANG=C.UTF-8
+DOTNET_INSTALL_DIR=${SAMPLES}/home/idle-1/.dotnet
+AGENT_TOOLSDIRECTORY=${TOOL_CACHE_DIR}
+RUNNER_TOOL_CACHE=${TOOL_CACHE_DIR}" "$(<"${SAMPLES}/home/idle-1/.env")"
+check "configure runners: tool cache created" "ok" "$(outcome test -d "${TOOL_CACHE_DIR}")"
+check "configure runners: second run changes nothing" "" "$(RUNNER_HOME="${SAMPLES}/home" configure_runners)"
+unset -f systemctl
+
+# ---------------------------------------------------------------------------------------------
 # status and stats end to end, with systemd, the journal and processes replaced by samples
 # ---------------------------------------------------------------------------------------------
 

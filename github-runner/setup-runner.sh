@@ -10,7 +10,9 @@
 #      Docker clean-up.
 #   5. Downloads the latest runner release, checks its SHA-256, and registers runners
 #      for each repository as systemd services.
-#   6. Installs the "ghrunner" management command (/usr/local/bin/ghrunner).
+#   6. Gives every runner, new or existing, the .env settings that tell jobs where to install tools
+#      (.NET, and the tool cache Python and Ruby need), restarting idle runners whose settings changed.
+#   7. Installs the "ghrunner" management command (/usr/local/bin/ghrunner).
 #
 # Needs runner-lib.sh and ghrunner.sh in the same folder as this script.
 #
@@ -269,6 +271,10 @@ setup() {
       install_runner "${full}" "${index}" "${archive}"
     done
   done
+
+  log "Runner settings (.env)"
+  configure_runners
+  note "all runners up to date"
 
   log "Done"
   if [[ -f /var/run/reboot-required ]]; then

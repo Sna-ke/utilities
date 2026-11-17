@@ -158,25 +158,6 @@ unit_identity() {
   printf '%s\tunknown\t-\n' "${base%.service}"
 }
 
-# Prints the actions.runner.* unit named in a /proc/<pid>/cgroup file read from stdin.
-unit_from_cgroup() {
-  grep -m 1 -oE 'actions\.runner\.[^/]*\.service'
-}
-
-# True when <unit> is one of the lines of <list> (e.g. the busy units).
-unit_in_list() {
-  [[ -n $1 ]] && grep -qxF -- "$1" <<<"$2"
-}
-
-# Prints the unit of every runner with a Runner.Worker process, i.e. a job in progress. The worker runs
-# inside its runner's service, so its cgroup, which any user can read, names the runner.
-busy_units() {
-  local pid
-  while read -r pid; do
-    unit_from_cgroup 2>/dev/null <"/proc/${pid}/cgroup" || true
-  done < <(pgrep -x Runner.Worker || true) | sort -u
-}
-
 # Prints runner folders that have a .runner file but no installed service (only visible to root).
 unserviced_runner_dirs() {
   local directory units
@@ -369,6 +350,9 @@ add() {
   for ((index = 1; index <= RUNNER_COUNT; index++)); do
     install_runner "${full}" "${index}" "${archive}"
   done
+  log "Runner settings (.env)"
+  configure_runners
+  note "all runners up to date"
   status
 }
 
@@ -764,6 +748,36 @@ check_ssh() {
   fi
 }
 
+# Lists runner folders whose .env lacks any of runner_env_settings, comma-separated (root only).
+runners_missing_settings() {
+  local directory setting
+  for directory in "${RUNNER_HOME}"/*/; do
+    directory="${directory%/}"
+    [[ -f ${directory}/.runner ]] || continue
+    while read -r setting; do
+      if ! grep -qxF -- "${setting}" "${directory}/.env" 2>/dev/null; then
+        echo "${directory##*/}"
+        break
+      fi
+    done < <(runner_env_settings "${directory}")
+  done | paste -sd, -
+}
+
+# Tool locations: without them, setup-dotnet, setup-python and setup-ruby fail with "Permission denied".
+check_tool_settings() {
+  local owner missing
+  owner="$(stat -c %U "${TOOL_CACHE_DIR}" 2>/dev/null || true)"
+  if [[ ${owner} != "${RUNNER_USER}" ]]; then
+    record WARN "Tool locations" "${TOOL_CACHE_DIR} ${owner:+is owned by ${owner}}${owner:-missing}: run setup-runner.sh again"
+  elif [[ ${EUID} -ne 0 ]]; then
+    record PASS "Tool locations" "${TOOL_CACHE_DIR} ready (run with sudo to check each runner's .env)"
+  elif missing="$(runners_missing_settings)" && [[ -n ${missing} ]]; then
+    record WARN "Tool locations" ".env settings missing for ${missing}: run setup-runner.sh again"
+  else
+    record PASS "Tool locations" "${TOOL_CACHE_DIR} ready; every runner's .env set"
+  fi
+}
+
 # Reboot: security updates to the kernel and libraries only take effect after one.
 check_reboot() {
   if [[ -f /var/run/reboot-required ]]; then
@@ -793,6 +807,7 @@ doctor() {
   check_disk
   check_docker
   check_runner_services
+  check_tool_settings
   check_cleanup_job
   check_firewall
   check_ssh
