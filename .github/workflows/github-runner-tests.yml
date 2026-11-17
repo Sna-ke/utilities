@@ -1,0 +1,19 @@
+# Runs ghrunner's parsing tests against sample input; no runner host needed. This repository is public, so
+# GitHub-hosted runners cost nothing.
+name: github-runner tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: ghrunner parsing tests (jq is preinstalled on GitHub's Ubuntu runners)
+        run: bash github-runner/tests/ghrunner-test.sh

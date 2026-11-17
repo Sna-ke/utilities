@@ -10,10 +10,13 @@
 #      Docker clean-up.
 #   5. Downloads the latest runner release, checks its SHA-256, and registers runners
 #      for each repository as systemd services.
+#   6. Installs the "ghrunner" management command (/usr/local/bin/ghrunner).
+#
+# Needs runner-lib.sh and ghrunner.sh in the same folder as this script.
 #
 # Usage (as root, on the VM):
 #   setup-runner.sh            set up, or add missing runners
-#   setup-runner.sh status     list the runner services
+#   setup-runner.sh status     list the runners (same as "ghrunner status")
 #   setup-runner.sh remove     unregister every runner on this VM (before deleting it)
 #
 # Settings come from environment variables (defaults in brackets):
@@ -37,19 +40,17 @@
 
 set -Eeuo pipefail
 
-GITHUB_OWNER="${GITHUB_OWNER:-Sna-ke}"
 RUNNER_REPOS="${RUNNER_REPOS:-GroundCore}"
-RUNNER_COUNT="${RUNNER_COUNT:-auto}"
-STACK_LABEL="${STACK_LABEL:-auto}"
 SWAP_SIZE_GB="${SWAP_SIZE_GB:-auto}"
-RUNNER_NAME_PREFIX="${RUNNER_NAME_PREFIX:-$(hostname -s)}"
-RUNNER_USER="runner"
-RUNNER_HOME="/home/${RUNNER_USER}"
-DOWNLOAD_DIR="/var/cache/actions-runner"
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 
-log() { printf '\n==> %s\n' "$*"; }
-note() { printf '    %s\n' "$*"; }
-die() { printf '\nERROR: %s\n' "$*" >&2; exit 1; }
+if [[ ! -f ${SCRIPT_DIR}/runner-lib.sh ]]; then
+  printf '\nERROR: runner-lib.sh is missing from %s. Download it and ghrunner.sh next to this script.\n' \
+    "${SCRIPT_DIR}" >&2
+  exit 1
+fi
+# shellcheck source=SCRIPTDIR/runner-lib.sh
+. "${SCRIPT_DIR}/runner-lib.sh"
 trap 'die "line ${LINENO}: \"${BASH_COMMAND}\" failed"' ERR
 
 # ---------------------------------------------------------------------------------------------
@@ -66,31 +67,11 @@ require_root_on_ubuntu() {
   [[ ${VERSION_ID} == "24.04" ]] || note "tested on Ubuntu 24.04; this is ${VERSION_ID}, continuing"
 }
 
-# Total memory in whole gigabytes, rounded to the nearest (a "4 GB" VPS reports about 3.8).
-memory_gb() {
-  awk '/MemTotal/ { printf "%d", ($2 / 1024 / 1024) + 0.5 }' /proc/meminfo
-}
-
-# The runner release's name for this CPU.
-runner_architecture() {
-  case "$(uname -m)" in
-    x86_64) echo "x64" ;;
-    aarch64) echo "arm64" ;;
-    *) die "unsupported CPU architecture: $(uname -m)" ;;
-  esac
-}
-
 # Resolves the "auto" settings from the machine's memory, so one script fits VPS-1 to VPS-3.
 resolve_auto_settings() {
   local memory
   memory="$(memory_gb)"
-  if [[ ${RUNNER_COUNT} == "auto" ]]; then
-    if ((memory >= 10)); then RUNNER_COUNT=2; else RUNNER_COUNT=1; fi
-  fi
-  if [[ ${STACK_LABEL} == "auto" ]]; then
-    # The GroundCore stack job needs about 3-4 GB on its own; below 6 GB it stays on GitHub's runners.
-    if ((memory >= 6)); then STACK_LABEL="yes"; else STACK_LABEL="no"; fi
-  fi
+  resolve_runner_settings
   if [[ ${SWAP_SIZE_GB} == "auto" ]]; then
     if ((memory < 10)); then SWAP_SIZE_GB=4; else SWAP_SIZE_GB=0; fi
   fi
@@ -215,13 +196,26 @@ configure_docker_daemon() {
 
 schedule_docker_cleanup() {
   log "Scheduling a weekly Docker clean-up"
-  cat >/etc/cron.weekly/docker-prune <<'EOF'
+  cat >"${PRUNE_SCRIPT}" <<'EOF'
 #!/bin/sh
 # Written by setup-runner.sh: CI leaves images, build cache and volumes behind.
+# "ghrunner prune" runs this file too. The journal line (tag docker-prune) is how "ghrunner stats"
+# knows when it last ran.
+set -e
 docker system prune -af --filter "until=168h" >/dev/null
 docker volume prune -af >/dev/null
+logger -t docker-prune "Docker clean-up finished"
 EOF
-  chmod +x /etc/cron.weekly/docker-prune
+  chmod +x "${PRUNE_SCRIPT}"
+}
+
+# Installs the management command and the file it shares with this script. Copies, not links, so
+# deleting the download folder doesn't break it; running this again just replaces them.
+install_ghrunner() {
+  log "Installing the ghrunner command"
+  install -D -m 0644 "${SCRIPT_DIR}/runner-lib.sh" "${GHRUNNER_LIB_DIR}/runner-lib.sh"
+  install -m 0755 "${SCRIPT_DIR}/ghrunner.sh" /usr/local/bin/ghrunner
+  note "run 'ghrunner help' for its commands"
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -247,96 +241,13 @@ create_runner_user() {
   install -d -o "${RUNNER_USER}" -g "${RUNNER_USER}" /usr/share/dotnet
 }
 
-# Downloads the latest runner release once and checks it against GitHub's published SHA-256:
-# the release asset's digest, or the checksum GitHub lists in the release notes.
-# Prints the path of the verified archive.
-download_runner() {
-  local architecture release version asset expected archive actual
-  architecture="$(runner_architecture)"
-  release="$(curl -fsSL https://api.github.com/repos/actions/runner/releases/latest)"
-  version="$(jq -r '.tag_name | ltrimstr("v")' <<<"${release}")"
-  asset="actions-runner-linux-${architecture}-${version}.tar.gz"
-  archive="${DOWNLOAD_DIR}/${asset}"
-
-  expected="$(jq -r --arg name "${asset}" '.assets[] | select(.name == $name) | .digest // empty' <<<"${release}")"
-  expected="${expected#sha256:}"
-  if [[ -z ${expected} ]]; then
-    expected="$(jq -r '.body' <<<"${release}" |
-      grep -oE "BEGIN SHA linux-${architecture} -->[0-9a-f]{64}" | grep -oE '[0-9a-f]{64}$' || true)"
-  fi
-  [[ ${expected} =~ ^[0-9a-f]{64}$ ]] || die "no published SHA-256 found for ${asset}"
-
-  mkdir -p "${DOWNLOAD_DIR}"
-  if [[ ! -f ${archive} ]]; then
-    curl -fsSL -o "${archive}.part" \
-      "https://github.com/actions/runner/releases/download/v${version}/${asset}"
-    mv "${archive}.part" "${archive}"
-  fi
-  actual="$(sha256sum "${archive}" | cut -d' ' -f1)"
-  if [[ ${actual} != "${expected}" ]]; then
-    rm -f "${archive}"
-    die "SHA-256 mismatch for ${asset}: expected ${expected}, got ${actual}"
-  fi
-  echo "${archive}"
-}
-
-# Asks GitHub for a short-lived registration or removal token for one repository.
-# kind: registration-token | remove-token
-runner_token() {
-  local repository="$1" kind="$2" token
-  if [[ -n ${GITHUB_TOKEN:-} ]]; then
-    token="$(curl -fsSL -X POST \
-      -H "Authorization: Bearer ${GITHUB_TOKEN}" \
-      -H "Accept: application/vnd.github+json" \
-      -H "X-GitHub-Api-Version: 2022-11-28" \
-      "https://api.github.com/repos/${GITHUB_OWNER}/${repository}/actions/runners/${kind}" | jq -r '.token')"
-  else
-    local action="New self-hosted runner"
-    [[ ${kind} == "remove-token" ]] && action="the runner's Remove button"
-    printf '    Paste a token for %s/%s (Settings > Actions > Runners > %s): ' \
-      "${GITHUB_OWNER}" "${repository}" "${action}" >/dev/tty
-    read -r -s token </dev/tty
-    printf '\n' >/dev/tty
-  fi
-  [[ -n ${token} && ${token} != "null" ]] || die "no ${kind} for ${repository}"
-  echo "${token}"
-}
-
-# Installs, registers and starts runner number <index> for one repository. Skips a runner that is
-# already registered, so running the script again only adds what is missing.
-install_runner() {
-  local repository="$1" index="$2" archive="$3"
-  local slug directory name labels token
-  slug="$(tr '[:upper:]' '[:lower:]' <<<"${repository}")"
-  directory="${RUNNER_HOME}/${slug}-${index}"
-  name="${RUNNER_NAME_PREFIX}-${slug}-${index}"
-  labels="${slug}-ci"
-  if [[ ${index} -eq 1 && ${STACK_LABEL} == "yes" ]]; then labels="${labels},${slug}-stack"; fi
-
-  log "Runner ${name} (labels: ${labels})"
-  if [[ -f ${directory}/.runner ]]; then
-    note "already registered"
-    return
-  fi
-  install -d -o "${RUNNER_USER}" -g "${RUNNER_USER}" "${directory}"
-  tar -xzf "${archive}" -C "${directory}"
-  chown -R "${RUNNER_USER}:${RUNNER_USER}" "${directory}"
-  "${directory}/bin/installdependencies.sh" >/dev/null
-
-  token="$(runner_token "${repository}" registration-token)"
-  (cd "${directory}" && sudo -u "${RUNNER_USER}" ./config.sh --unattended --replace \
-    --url "https://github.com/${GITHUB_OWNER}/${repository}" --token "${token}" \
-    --name "${name}" --labels "${labels}" --work _work)
-  (cd "${directory}" && ./svc.sh install "${RUNNER_USER}" >/dev/null && ./svc.sh start >/dev/null)
-  note "registered and running"
-}
-
 # ---------------------------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------------------------
 
 setup() {
   require_root_on_ubuntu
+  [[ -f ${SCRIPT_DIR}/ghrunner.sh ]] || die "ghrunner.sh is missing from ${SCRIPT_DIR}; download it next to this script"
   resolve_auto_settings
   install_base_packages
   enable_automatic_updates
@@ -347,17 +258,19 @@ setup() {
   configure_docker_daemon
   schedule_docker_cleanup
   create_runner_user
+  install_ghrunner
 
   log "Downloading the runner"
-  local archive repository index
+  local archive repository full index
   local -a repositories
   archive="$(download_runner)"
   note "verified $(basename "${archive}")"
 
   IFS=',' read -r -a repositories <<<"${RUNNER_REPOS}"
   for repository in "${repositories[@]}"; do
+    full="$(full_repository_name "${repository}")" || exit 1
     for ((index = 1; index <= RUNNER_COUNT; index++)); do
-      install_runner "${repository}" "${index}" "${archive}"
+      install_runner "${full}" "${index}" "${archive}"
     done
   done
 
@@ -367,24 +280,21 @@ setup() {
   fi
   note "Next, in each repository: Settings > Secrets and variables > Actions > Variables."
   note "GroundCore: CI_RUNNER=groundcore-ci; CI_STACK_RUNNER=groundcore-stack only if a runner has that label."
+  note "Check the host any time with: ghrunner doctor"
 }
 
 status() {
-  systemctl list-units --all --no-pager 'actions.runner.*'
+  bash "${SCRIPT_DIR}/ghrunner.sh" status
 }
 
 # Unregisters every runner on this VM, so GitHub doesn't keep offline runners after the VM is gone.
 remove() {
   require_root_on_ubuntu
-  local directory url repository token
+  local directory
   for directory in "${RUNNER_HOME}"/*/; do
     [[ -f ${directory}.runner ]] || continue
-    url="$(jq -r '.gitHubUrl' "${directory}.runner")"
-    repository="${url##*/}"
-    log "Removing $(basename "${directory}") from ${repository}"
-    (cd "${directory}" && ./svc.sh stop >/dev/null && ./svc.sh uninstall >/dev/null) || true
-    token="$(runner_token "${repository}" remove-token)"
-    (cd "${directory}" && sudo -u "${RUNNER_USER}" ./config.sh remove --token "${token}")
+    log "Removing $(basename "${directory}") from $(runner_repository "${directory%/}")"
+    unregister_runner "${directory}"
   done
   log "Done: runners unregistered. The VM can be deleted."
 }
