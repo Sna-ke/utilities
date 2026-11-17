@@ -24,7 +24,7 @@ running the host day to day.
 | Firewall | ufw: SSH in (rate-limited), nothing else. Runners only call out to GitHub |
 | Kernel network settings | Ignores ICMP redirects and source routing, sends no redirects, hides kernel addresses |
 | Audit | A baseline of the machine, checked daily (see Security) |
-| Alerts | Optional: a URL alerts are posted to, e.g. an ntfy.sh topic for your phone |
+| Alerts | Optional: Pushover notifications to your phone |
 | Docker | Docker Engine and Compose from Docker's apt repository. Published ports bind to 127.0.0.1, because Docker's port rules bypass ufw. Container logs capped |
 | Swap | 4 GB on machines under 10 GB of RAM |
 | Clean-up | Weekly `docker system prune` (`/etc/cron.weekly/docker-prune`), logged to the journal |
@@ -91,7 +91,8 @@ Whatever it can't do, it lists under "Still to do" with the reason and how to fi
    | GitHub token | The token from step 2 (hidden, kept in memory only), or Enter |
    | SSH port | Enter for the suggested one (9452 on a new VM; afterwards, the current one) |
    | Did the new port work? | Open a second terminal, log in with the `ssh -p` command it shows, then answer. Port 22 closes only after a yes |
-   | Alert URL | e.g. `https://ntfy.sh/<long-random-topic>` (subscribe to it in the ntfy app), or Enter for none |
+   | Pushover user key | From pushover.net once you log in, or Enter for no alerts |
+   | Pushover application token | Create an application at pushover.net/apps/build (any name). Setup checks both with Pushover and sends a test alert |
 
    To serve more repositories: `curl ... | sudo RUNNER_REPOS=GroundCore,mealplan bash`. To read the scripts before
    running them, download `install.sh` and open it: it lists what it fetches.
@@ -113,11 +114,36 @@ To try a pull request's version on a VM before merging it, install from its bran
 | `ghrunner status` | Each runner: service state, idle or busy, and the job it is running | No |
 | `ghrunner stats [days]` | From the journal, for the last 7 days or `days`: jobs started and completed, results and average time, per runner and per repository. Then disk use of `/` and Docker, memory, swap, the last clean-up and the last reboot | No |
 | `ghrunner prune` | Runs the weekly clean-up now and shows the space freed | Yes |
-| `ghrunner doctor` | Checks disk (warn under 20% free, fail under 10%), Docker, every runner service, sizing, private repositories, tool locations, the scheduled jobs, the firewall, SSH, the audit, the kernel, a pending reboot, swap and the ghrunner version. Prints PASS/WARN/FAIL and exits 1 on any FAIL | No |
+| `ghrunner doctor [--fix]` | Checks the host (see below). Prints PASS/WARN/FAIL and exits 1 on any FAIL. `--fix` runs the installed setup again when a problem is one it fixes, then checks again | No (`--fix`: yes) |
 | `ghrunner audit [--accept]` | Lists what changed since the audit baseline (see Security). `--accept` makes the current state the baseline, after you've checked the changes are yours | Yes |
 | `ghrunner version` | The installed version and commit, the latest on `main`, and whether they match | No |
 | `ghrunner self-update [--yes]` | Updates to the latest `main`, after listing what changed (see Updating) | Yes |
 | `ghrunner help` | Lists the commands | No |
+
+### What `doctor` checks
+
+| Check | Passes when | `--fix` fixes it |
+| --- | --- | --- |
+| Disk free | 20% or more free on `/` (warns under 20%, fails under 10%) | No: `sudo ghrunner prune` |
+| Docker | Running | No |
+| Docker ports | Published ports bind to 127.0.0.1 | Yes |
+| Runner services | All active | No |
+| Sizing | Runners and labels fit the machine | Yes (runs `resize`) |
+| Private repositories | No runner serves a public repository | No: `sudo ghrunner delete <repo>` |
+| Tool locations | The tool cache exists, and every runner's `.env` is set | Yes |
+| Scheduled jobs | Clean-up, weekly update and daily audit are on, and didn't fail last time | Yes |
+| Security updates | Daily unattended upgrades on | Yes |
+| Firewall | On, letting in only SSH, rate-limited | Yes |
+| SSH | Keys only, one port and not 22, root and `runner` can't log in, 3 tries at most | Yes (asks for the port) |
+| Kernel settings | The hardened network settings are in force | Yes |
+| Alerts | Pushover set up | Yes (asks for the key and token) |
+| Audit | Ran in the last 2 days with no unaccepted changes | No: `sudo ghrunner audit` |
+| Kernel | Running the newest installed kernel | No: `sudo reboot` |
+| Reboot pending | No reboot pending | No: `sudo reboot` |
+| Swap | On, below 10 GB of memory | Yes |
+| ghrunner version | Same as `main` | No: `sudo ghrunner self-update` |
+
+Without sudo, the firewall rules, the alert settings and repository visibility aren't checked.
 
 `<repo>` is a repository name (owner `GITHUB_OWNER`, default `Sna-ke`) or `owner/repo`. `add` and `delete` get
 tokens the same way as `setup-runner.sh`: from `GITHUB_TOKEN`, or by asking you to paste one. For example:
@@ -180,7 +206,7 @@ Runner names include the VM's hostname, so old and new never clash.
 | Updates | Ubuntu's security updates daily. A full update (Docker included) weekly, Sunday 11:00 UTC (`UPDATE_SCHEDULE`): it waits until no job runs, pauses the runners, upgrades, and starts them again. It never reboots: a waiting kernel shows at login, in `doctor`, and as an alert |
 | Public repositories | Refused. On a public repository anyone can open a pull request, and its workflow would run as root here |
 | Audit | Setup records a baseline: accounts, SSH keys, sudo rules, SSH settings, firewall rules, ports open to the outside, cron jobs, services that start at boot, setuid programs, ghrunner's own files, and where SSH logins come from. A timer compares the machine with it daily |
-| Hearing about it | Audit findings and a waiting kernel show at every SSH login and in `ghrunner doctor`, and go to the alert URL if you set one (once per new set of findings, not daily) |
+| Hearing about it | Audit findings and a waiting kernel show at every SSH login and in `ghrunner doctor`, and go to Pushover if you set it up (once per new set of findings, not daily). Audit alerts are high priority, so they sound even in quiet hours. The key and token are kept in `/etc/ghrunner/pushover`, readable by root only |
 | Updates can't bless a compromise | Setup, and so `self-update`, checks the audit first and stops if anything changed that nobody accepted |
 
 **Limits.** CI jobs run as root (Docker and sudo), which is why only private repositories you alone push to belong
@@ -240,8 +266,9 @@ Only a real runner host can test the rest:
 2. systemd: unit names as the runner's `svc.sh` writes them, service states, `Runner.Worker` cgroups (`status`).
 3. journald: the runner's real output lines and the clean-up job's log line (`status`, `stats`, `update`).
 4. Docker, apt, ufw, sshd and cron as they behave on Ubuntu 24.04 (`prune`, `update`, `doctor`).
-5. Moving the SSH port (ssh.socket taking the port from sshd's settings), the timers, the login message, alerts,
-   and a full audit snapshot (`ss`, `ssh-keygen`, `find`, `sshd -T`).
+5. Moving the SSH port (ssh.socket taking the port from sshd's settings), the timers, the login message, Pushover
+   (this repository's tests can't reach it), `doctor --fix`, and a full audit snapshot (`ss`, `ssh-keygen`, `find`,
+   `sshd -T`).
 6. The one-line installer end to end. Its download and hash checks were tested against this repository on GitHub.
 7. A full `self-update` (it runs `setup-runner.sh`). Its version check, hashes and download were tested against
    this repository on GitHub.

@@ -264,50 +264,74 @@ one is still open. Check you can log in with 'ssh -p ${port}', then run setup ag
   fi
 }
 
-# Ignore ICMP redirects and source-routed packets (both let others reroute this VM's traffic), send no
-# redirects, and hide kernel addresses from unprivileged users.
+# Applies KERNEL_SETTINGS (runner-lib.sh says what each does) now and at every boot.
 harden_kernel() {
   log "Hardening kernel network settings"
-  cat >/etc/sysctl.d/90-runner-hardening.conf <<'EOF'
-# Written by setup-runner.sh.
-net.ipv4.conf.all.accept_redirects = 0
-net.ipv4.conf.default.accept_redirects = 0
-net.ipv6.conf.all.accept_redirects = 0
-net.ipv6.conf.default.accept_redirects = 0
-net.ipv4.conf.all.send_redirects = 0
-net.ipv4.conf.default.send_redirects = 0
-net.ipv4.conf.all.accept_source_route = 0
-net.ipv6.conf.all.accept_source_route = 0
-kernel.kptr_restrict = 2
-kernel.dmesg_restrict = 1
-EOF
-  sysctl -q -p /etc/sysctl.d/90-runner-hardening.conf
+  { echo "# Written by setup-runner.sh."; printf '%s\n' "${KERNEL_SETTINGS[@]}"; } >/etc/sysctl.d/90-runner-hardening.conf
+  # -e: skip settings this kernel doesn't have (the IPv6 ones when IPv6 is off) instead of failing.
+  sysctl -q -e -p /etc/sysctl.d/90-runner-hardening.conf
 }
 
-# Asks for the URL alerts are posted to (an ntfy.sh topic works: install the ntfy app and subscribe to
-# it). Enter keeps the current one; "-" turns alerts off. Kept in a root-only file.
-configure_alerts() {
-  log "Alerts"
-  local current="" answer
-  if [[ -r ${ALERT_URL_FILE} ]]; then current="$(<"${ALERT_URL_FILE}")"; fi
-  if has_terminal; then
-    printf '    Where should alerts go? A URL that takes a plain-text POST, e.g. https://ntfy.sh/<long-random-topic>\n' >/dev/tty
-    printf '    [%s] (Enter keeps it, "-" for none): ' "${current:-none}" >/dev/tty
-    read -r answer </dev/tty
-    case "${answer}" in
-      "") ;;
-      -) current="" ;;
-      https://*) current="${answer}" ;;
-      *) note "not an https:// URL; keeping the current setting" ;;
-    esac
+# Asks for Pushover's user key and application token. Prints "keep", "off", or "<user key>\t<token>".
+ask_pushover() {
+  local current="$1" shown="none" user token
+  if [[ -n ${current} ]]; then shown="set, ending ${current: -4}"; fi
+  printf '    Alerts go to Pushover. Your user key is on https://pushover.net once you log in. For the token,\n' >/dev/tty
+  printf '    create an application at https://pushover.net/apps/build (any name, e.g. "Runner host").\n' >/dev/tty
+  printf '    Pushover user key [%s] (Enter keeps it, "-" for no alerts): ' "${shown}" >/dev/tty
+  read -r user </dev/tty
+  case "${user}" in
+    "") echo "keep" && return ;;
+    -) echo "off" && return ;;
+  esac
+  if ! valid_pushover_key "${user}"; then
+    printf '    That is not a Pushover user key (30 letters and digits); keeping the current setting.\n' >/dev/tty
+    echo "keep"
+    return
   fi
-  install -d -m 0700 "$(dirname "${ALERT_URL_FILE}")"
-  (umask 077 && printf '%s' "${current}" >"${ALERT_URL_FILE}")
-  if [[ -n ${current} ]]; then
-    send_alert "alerts on" "ghrunner will post here when this runner host needs you."
-    note "alerts go to the URL you gave (a test alert was sent)"
+  printf '    Pushover application token (hidden): ' >/dev/tty
+  read -r -s token </dev/tty
+  printf '\n' >/dev/tty
+  if ! valid_pushover_key "${token}"; then
+    printf '    That is not a Pushover token (30 letters and digits); keeping the current setting.\n' >/dev/tty
+    echo "keep"
+    return
+  fi
+  printf '%s\t%s\n' "${user}" "${token}"
+}
+
+# Saves the Pushover user key and token in a root-only file.
+save_pushover() {
+  install -d -m 0700 "$(dirname "${PUSHOVER_FILE}")"
+  (umask 077 && printf 'PUSHOVER_USER=%s\nPUSHOVER_TOKEN=%s\n' "$1" "$2" >"${PUSHOVER_FILE}")
+}
+
+# Sets up alerts to Pushover: asks for the user key and application token (Enter keeps the current
+# ones), checks them with Pushover before saving, and sends a test alert.
+configure_alerts() {
+  log "Alerts (Pushover)"
+  local user="" token="" answer="keep"
+  rm -f "${OLD_ALERT_URL_FILE}"
+  IFS=$'\t' read -r user token <<<"$(pushover_settings)"
+  if has_terminal; then answer="$(ask_pushover "${user}")"; fi
+  case "${answer}" in
+    keep) ;;
+    off) rm -f "${PUSHOVER_FILE}" ;;
+    *)
+      IFS=$'\t' read -r user token <<<"${answer}"
+      if pushover_valid "${user}" "${token}"; then
+        save_pushover "${user}" "${token}"
+        send_alert "alerts on" "ghrunner will alert you here when this runner host needs you."
+      else
+        STILL_TO_DO+=("Pushover didn't accept that user key and application token, or the account has no active \
+device, so alerts were left as they were. Check both on pushover.net, then run setup again.")
+      fi
+      ;;
+  esac
+  if [[ -n "$(pushover_settings)" ]]; then
+    note "alerts go to Pushover"
   else
-    note "no alert URL: problems show at SSH login and in 'ghrunner doctor'"
+    note "no alerts: problems show at SSH login and in 'ghrunner doctor'"
   fi
 }
 
