@@ -518,10 +518,12 @@ ALERTS="${SAMPLES}/alerts"
 # shellcheck disable=SC2317,SC2329
 send_alert() { echo "$1" >>"${ALERTS}"; }
 audit_record "$(printf 'sudo\tchanged\t/etc/sudoers')"
+check "a manual check doesn't alert" "fails" "$(outcome test -e "${ALERTS}")"
+audit_record "$(printf 'sudo\tchanged\t/etc/sudoers')" yes
 check "findings: status for doctor" "1" "$(cut -f2 "${AUDIT_STATUS}")"
 check "findings: note for the next login" "1" "$(grep -c 'nobody accepted' "${GHRUNNER_STATE_DIR}/attention/audit")"
 check "findings: one alert" "audit found 1 unexpected change(s)" "$(cat "${ALERTS}")"
-audit_record "$(printf 'sudo\tchanged\t/etc/sudoers')"
+audit_record "$(printf 'sudo\tchanged\t/etc/sudoers')" yes
 check "same findings tomorrow: no second alert" "1" "$(wc -l <"${ALERTS}" | tr -d ' ')"
 audit_record ""
 check "all clear: login note removed" "fails" "$(outcome test -e "${GHRUNNER_STATE_DIR}/attention/audit")"

@@ -834,10 +834,10 @@ audit_accept() {
   mv "${AUDIT_BASELINE}.new" "${AUDIT_BASELINE}"
 }
 
-# Records an audit's result for doctor ("<epoch>\t<number of changes>") and the login message, and
-# alerts when the set of changes is new (not every day for the same ones).
+# Records an audit's result for doctor ("<epoch>\t<number of changes>") and the login message. With
+# <alert> "yes" (the daily run), also alerts when the set of changes is new, not every day for the same ones.
 audit_record() {
-  local findings="$1" count=0 digest previous=""
+  local findings="$1" alert="${2:-no}" count=0 digest previous=""
   [[ -z ${findings} ]] || count="$(wc -l <<<"${findings}")"
   printf '%s\t%s\n' "$(date +%s)" "${count}" >"${AUDIT_STATUS}"
   if ((count == 0)); then
@@ -850,6 +850,7 @@ audit_record() {
     head -n 5 <<<"${findings}" | sed 's/\t/ /g; s/^/  /'
     printf 'If you made them: sudo ghrunner audit --accept. If not: see "If the VM is compromised" in the README.\n'
   } | set_attention audit
+  [[ ${alert} == "yes" ]] || return 0
   digest="$(sha256sum <<<"${findings}" | cut -c1-16)"
   if [[ -f ${GHRUNNER_STATE_DIR}/audit-alerted ]]; then previous="$(<"${GHRUNNER_STATE_DIR}/audit-alerted")"; fi
   if [[ ${digest} != "${previous}" ]]; then
@@ -906,7 +907,7 @@ audit() {
       [[ -z ${blocking} ]]
       ;;
     --notify)
-      audit_record "${findings}"
+      audit_record "${findings}" yes
       [[ -z ${findings} ]]
       ;;
     *)
