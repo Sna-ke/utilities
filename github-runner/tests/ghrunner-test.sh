@@ -395,6 +395,26 @@ printf 'echo two\n' >"${SAMPLES}/installed/setup-runner.sh"
 check "a changed file doesn't match" "fails" "$(outcome files_match "${SAMPLES}/installed" "${BLOBS}")"
 check "a missing file doesn't match" "fails" "$(outcome files_match "${SAMPLES}/nowhere" "${BLOBS}")"
 check "an empty listing doesn't match" "fails" "$(outcome files_match "${SAMPLES}/installed" "")"
+check "version in runner-lib.sh" "${GHRUNNER_VERSION}" "$(version_from_text <"${TESTS_DIR}/../runner-lib.sh")"
+check "version: none in an old copy" "" "$(version_from_text <<<'GITHUB_OWNER="x"')"
+check "newer: 1.10.0 vs 1.9.0" "ok" "$(outcome version_newer 1.10.0 1.9.0)"
+check "newer: same version" "fails" "$(outcome version_newer 1.3.0 1.3.0)"
+check "newer: older" "fails" "$(outcome version_newer 1.2.9 1.3.0)"
+check "changelog has a line for this version" "1" \
+  "$(changelog_since 0 <"${TESTS_DIR}/../CHANGELOG.md" | grep -c "^${GHRUNNER_VERSION//./\\.}  ")"
+CHANGELOG_SAMPLE="| Version | Date | Changes |
+| --- | --- | --- |
+| 1.10.0 | 2026-12-01 | Ten |
+| 1.9.0 | 2026-11-30 | Nine, with \`code\` |
+| 1.3.0 | 2026-11-17 | Three |"
+check "changelog since 1.3.0" "1.10.0  2026-12-01  Ten
+1.9.0  2026-11-30  Nine, with \`code\`" "$(changelog_since 1.3.0 <<<"${CHANGELOG_SAMPLE}")"
+check "changelog since an old copy: everything" "3" \
+  "$(changelog_since "1.2.0 or older" <<<"${CHANGELOG_SAMPLE}" | wc -l | tr -d ' ')"
+check "changelog since the latest: nothing" "" "$(changelog_since 1.10.0 <<<"${CHANGELOG_SAMPLE}")"
+check "describe version with commit" "1.3.0 (commit abcdef1)" "$(describe_version 1.3.0 abcdef1234567890)"
+check "describe version, commit unknown" "1.3.0" "$(describe_version 1.3.0 unknown)"
+check "installed version of an old copy" "1.2.0 or older" "$(GHRUNNER_LIB_DIR="${SAMPLES}/installed" installed_version)"
 check "self-update without root" "fails" "$(outcome bash "${TESTS_DIR}/../ghrunner.sh" self-update --bogus)"
 
 # ---------------------------------------------------------------------------------------------

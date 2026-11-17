@@ -458,11 +458,23 @@ blobs_at() {
   github_api "contents/github-runner?ref=$1" | parse_blobs
 }
 
-# The commit recorded at install, or "unknown".
+# The commit recorded at install, or "unknown" (setup-runner.sh run from a download by hand).
 installed_commit() {
   local commit=""
   if [[ -r ${GHRUNNER_LIB_DIR}/VERSION ]]; then commit="$(<"${GHRUNNER_LIB_DIR}/VERSION")"; fi
   echo "${commit:-unknown}"
+}
+
+# The installed version number, from the installed runner-lib.sh. Copies older than 1.3.0 had none.
+installed_version() {
+  local version=""
+  if [[ -r ${GHRUNNER_LIB_DIR}/runner-lib.sh ]]; then version="$(version_from_text <"${GHRUNNER_LIB_DIR}/runner-lib.sh")"; fi
+  echo "${version:-1.2.0 or older}"
+}
+
+# Downloads one of github-runner's files at <commit> and prints it.
+file_at() {
+  curl -fsSL --max-time 60 "https://raw.githubusercontent.com/${GHRUNNER_REPO}/$1/github-runner/$2"
 }
 
 # True when every file in <folder> matches the blob hashes ("<name>\t<sha>" lines) given.
@@ -476,6 +488,7 @@ files_match() {
 
 # From commits ("<sha>\t<date>\t<title>", newest first) on stdin, prints the ones newer than <installed>
 # as "<short sha>  <date>  <title>". With an unknown or unlisted installed commit, prints the newest 5.
+# Used when a version's changelog can't be read.
 commits_since() {
   awk -F'\t' -v installed="$1" '
     $1 == installed { found = 1; exit }
@@ -483,22 +496,52 @@ commits_since() {
     END { for (i = 1; i <= count && (found || i <= 5); i++) print line[i] }'
 }
 
-# ghrunner version: the installed commit, the latest on main, and whether they match.
+# From CHANGELOG.md on stdin, prints "<version>  <date>  <changes>" for each version newer than
+# <installed> (every version when <installed> isn't a number), newest first.
+changelog_since() {
+  local version date changes
+  while IFS='|' read -r _ version date changes _; do
+    version="${version//[[:space:]\`]/}"
+    [[ ${version} =~ ^[0-9]+(\.[0-9]+)*$ ]] || continue
+    if [[ $1 =~ ^[0-9]+(\.[0-9]+)*$ ]] && ! version_newer "${version}" "$1"; then continue; fi
+    date="${date//[[:space:]]/}"
+    changes="${changes#"${changes%%[![:space:]]*}"}"
+    printf '%s  %s  %s\n' "${version}" "${date}" "${changes%"${changes##*[![:space:]]}"}"
+  done
+}
+
+# Prints "<version> (commit <short sha>)", or just the version when the commit is unknown.
+describe_version() {
+  if [[ $2 == "unknown" || -z $2 ]]; then echo "$1"; else echo "$1 (commit ${2:0:7})"; fi
+}
+
+# ghrunner version: the installed version, the latest on main, and whether they match. When the files
+# match main, that is the installed commit too, even if setup-runner.sh was run by hand.
 version() {
   no_arguments "$@"
-  local commits latest blobs state
+  local commits latest latest_version="" blobs state commit
+  commit="$(installed_commit)"
   commits="$(latest_commits 2>/dev/null || true)"
   latest="$(head -n 1 <<<"${commits}" | cut -f1)"
   if [[ -z ${latest} ]]; then
     state="can't tell: GitHub didn't answer"
   else
+    latest_version="$(file_at "${latest}" runner-lib.sh 2>/dev/null | version_from_text || true)"
     blobs="$(blobs_at "${latest}" 2>/dev/null || true)"
-    if files_match "${GHRUNNER_LIB_DIR}" "${blobs}"; then state="up to date"; else state="update available: sudo ghrunner self-update"; fi
+    if files_match "${GHRUNNER_LIB_DIR}" "${blobs}"; then
+      state="up to date"
+      commit="${latest}"
+    else
+      state="update available: sudo ghrunner self-update"
+    fi
   fi
   {
     printf 'ITEM\tVALUE\n'
-    printf 'Installed\t%s\n' "$(installed_commit | cut -c1-7)"
-    printf 'Latest on main\t%s\n' "$(head -n 1 <<<"${commits}" | awk -F'\t' '{ print substr($1, 1, 7) "  " $2 "  " $3 }')"
+    printf 'Installed\t%s\n' "$(describe_version "$(installed_version)" "${commit}")"
+    if [[ -n ${latest} ]]; then
+      printf 'Latest on main\t%s, %s\n' "$(describe_version "${latest_version:-1.2.0 or older}" "${latest}")" \
+        "$(head -n 1 <<<"${commits}" | cut -f2)"
+    fi
     printf 'Status\t%s\n' "${state}"
   } | print_table
 }
@@ -522,11 +565,20 @@ download_version() {
   files_match "${folder}" "${blobs}" || die "the downloaded files don't match GitHub's hashes for ${commit}"
 }
 
+# Prints what changed between the installed version and <latest commit>: the changelog entries when
+# that version has a changelog, else the commit titles.
+whats_new() {
+  local latest="$1" commits="$2" changes line
+  changes="$(file_at "${latest}" CHANGELOG.md 2>/dev/null | changelog_since "$(installed_version)" || true)"
+  if [[ -z ${changes} ]]; then changes="$(commits_since "$(installed_commit)" <<<"${commits}")"; fi
+  while IFS= read -r line; do note "${line}"; done <<<"${changes}"
+}
+
 # ghrunner self-update [--yes]: when main has a newer version, lists what changed, asks, downloads all
 # three files from that exact commit, and runs its setup-runner.sh: the same as updating by hand.
 self_update() {
   require_root
-  local assume_yes="no" commits latest blobs folder
+  local assume_yes="no" commits latest latest_version blobs folder
   case "${1:-}" in
     "") ;;
     --yes | -y) assume_yes="yes" ;;
@@ -539,22 +591,24 @@ self_update() {
   blobs="$(blobs_at "${latest}")" || die "couldn't list the files at ${latest}"
   if files_match "${GHRUNNER_LIB_DIR}" "${blobs}"; then
     echo "${latest}" >"${GHRUNNER_LIB_DIR}/VERSION"
-    note "already up to date (${latest:0:7})"
+    note "already up to date: $(describe_version "$(installed_version)" "${latest}")"
     return
   fi
-  note "installed: $(installed_commit | cut -c1-7)    latest: ${latest:0:7}"
-  log "Changes"
-  commits_since "$(installed_commit)" <<<"${commits}" | sed 's/^/    /'
+  latest_version="$(file_at "${latest}" runner-lib.sh | version_from_text || true)"
+  note "installed: $(describe_version "$(installed_version)" "$(installed_commit)")"
+  note "latest:    $(describe_version "${latest_version:-1.2.0 or older}" "${latest}")"
+  log "What's new"
+  whats_new "${latest}" "${commits}"
   note "Updating runs setup-runner.sh again: packages, ghrunner, runner settings and sizing."
   if [[ ${assume_yes} != "yes" ]]; then
     { true </dev/tty; } 2>/dev/null || die "no terminal to confirm on: run 'sudo ghrunner self-update --yes'"
-    confirm "Update to ${latest:0:7}?" || die "not updated"
+    confirm "Update to ${latest_version:-${latest:0:7}}?" || die "not updated"
   fi
 
   folder="$(mktemp -d)"
   # shellcheck disable=SC2064 # expand now: the folder is local to this function
   trap "rm -rf '${folder}'" EXIT
-  log "Downloading ${latest:0:7}"
+  log "Downloading ${latest_version:-${latest:0:7}}"
   download_version "${latest}" "${folder}" "${blobs}"
   note "all files match GitHub's hashes"
   GHRUNNER_COMMIT="${latest}" bash "${folder}/setup-runner.sh"
@@ -992,9 +1046,9 @@ check_ghrunner_version() {
   fi
   blobs="$(blobs_at "${latest}" 2>/dev/null || true)"
   if files_match "${GHRUNNER_LIB_DIR}" "${blobs}"; then
-    record PASS "ghrunner version" "up to date (${latest:0:7})"
+    record PASS "ghrunner version" "$(installed_version), up to date"
   else
-    record WARN "ghrunner version" "newer version on main (${latest:0:7}): sudo ghrunner self-update"
+    record WARN "ghrunner version" "$(installed_version) installed, newer on main: sudo ghrunner self-update"
   fi
 }
 
@@ -1060,6 +1114,7 @@ doctor() {
 
 # ghrunner help: the command list.
 usage() {
+  printf 'ghrunner %s\n\n' "${GHRUNNER_VERSION}"
   cat <<'EOF'
 Usage: ghrunner <command> [arguments]
 

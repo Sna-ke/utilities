@@ -12,6 +12,11 @@
 #
 # Secrets: none. GITHUB_TOKEN is read from the environment and never written to disk.
 
+# The version of these scripts. Every pull request that changes setup-runner.sh, runner-lib.sh or
+# ghrunner.sh raises it and adds a line to CHANGELOG.md; CI checks both (tests/version-check.sh).
+# shellcheck disable=SC2034 # read by the scripts that source this file
+GHRUNNER_VERSION="1.3.0"
+
 GITHUB_OWNER="${GITHUB_OWNER:-Sna-ke}"
 # shellcheck disable=SC2034 # read by the scripts that source this file
 RUNNER_COUNT="${RUNNER_COUNT:-auto}"
@@ -30,6 +35,16 @@ GHRUNNER_REPO="${GHRUNNER_REPO:-Sna-ke/utilities}"
 # shellcheck disable=SC2034 # read by the scripts that source this file
 GHRUNNER_FILES=(setup-runner.sh runner-lib.sh ghrunner.sh)
 TOOL_CACHE_DIR="/opt/hostedtoolcache"
+
+# From a runner-lib.sh on stdin, prints its GHRUNNER_VERSION, or nothing for a copy older than 1.3.0.
+version_from_text() {
+  sed -nE 's/^GHRUNNER_VERSION="([^"]+)".*/\1/p' | head -n 1
+}
+
+# True when version <a> is newer than <b> (numeric order: 1.10.0 is newer than 1.9.0).
+version_newer() {
+  [[ $1 != "$2" && "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n 1)" == "$1" ]]
+}
 
 # Prints a step heading, so long runs show where they are.
 log() { printf '\n==> %s\n' "$*"; }
