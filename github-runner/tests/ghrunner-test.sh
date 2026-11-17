@@ -15,6 +15,7 @@ TESTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "${TESTS_DIR}/../ghrunner.sh"
 trap - ERR # failures are reported by the checks below, not by ghrunner's trap
 
+unset GITHUB_TOKEN # nothing here may reach GitHub
 SAMPLES="$(mktemp -d)"
 trap 'rm -rf "${SAMPLES}"' EXIT
 PASSED=0
@@ -260,6 +261,103 @@ RUNNER_TOOL_CACHE=${TOOL_CACHE_DIR}" "$(<"${SAMPLES}/home/idle-1/.env")"
 check "configure runners: tool cache created" "ok" "$(outcome test -d "${TOOL_CACHE_DIR}")"
 check "configure runners: second run changes nothing" "" "$(RUNNER_HOME="${SAMPLES}/home" configure_runners)"
 unset -f systemctl
+
+# ---------------------------------------------------------------------------------------------
+# Sizing and resize
+# ---------------------------------------------------------------------------------------------
+
+check "sizing: VPS-1 (2 cores, 4 GB)" "1" "$(auto_runner_count 4 2)"
+check "sizing: VPS-2 (4 cores, 8 GB)" "1" "$(auto_runner_count 8 4)"
+check "sizing: VPS-3 (6 cores, 12 GB)" "2" "$(auto_runner_count 12 6)"
+check "sizing: VPS-4 (8 cores, 24 GB)" "2" "$(auto_runner_count 24 8)"
+check "sizing: lots of memory, 4 cores" "1" "$(auto_runner_count 32 4)"
+check "sizing: 12 cores, 48 GB" "4" "$(auto_runner_count 48 12)"
+STACK_LABEL=yes
+check "labels: runner 1 with stack" "groundcore-ci,groundcore-stack" "$(expected_labels groundcore 1)"
+check "labels: runner 2" "groundcore-ci" "$(expected_labels groundcore 2)"
+check "labels sorted for comparing" "a-ci,a-stack" "$(sort_labels <<<"a-stack,a-ci,")"
+check "count mismatches" "mealplan has 1" \
+  "$(printf 'a\tgroundcore\t1\nb\tgroundcore\t2\nc\tmealplan\t1\nd\tunknown\t-\n' | count_mismatches 2)"
+
+# Writes a sample runner folder: <folder name> <repository> [labels] [.service unit]
+sample_runner() {
+  local directory="${RUNNER_HOME}/$1"
+  mkdir -p "${directory}"
+  printf '{"agentName": "vps-%s", "agentId": 7, "gitHubUrl": "https://github.com/%s"}' "$1" "$2" >"${directory}/.runner"
+  if [[ -n ${3:-} ]]; then echo "$3" >"${directory}/.labels"; fi
+  if [[ -n ${4:-} ]]; then echo "$4" >"${directory}/.service"; fi
+}
+RUNNER_HOME="${SAMPLES}/resize-home"
+# shellcheck disable=SC2034 # read by resize_repository
+RUNNER_NAME_PREFIX="vps"
+sample_runner groundcore-1 Sna-ke/GroundCore groundcore-ci unit-1
+sample_runner groundcore-2 Sna-ke/GroundCore "" unit-2
+sample_runner groundcore-10 Sna-ke/GroundCore groundcore-ci unit-10
+sample_runner groundcore-x Sna-ke/GroundCore
+sample_runner mealplan-1 Sna-ke/MealPlan mealplan-ci
+check "runner folders of a repository, numeric order" "1	${RUNNER_HOME}/groundcore-1
+2	${RUNNER_HOME}/groundcore-2
+10	${RUNNER_HOME}/groundcore-10" "$(repository_runner_dirs Sna-ke/groundcore)"
+check "repositories with runners" $'Sna-ke/GroundCore\nSna-ke/MealPlan' "$(repositories_with_runners)"
+
+# Stand-ins for everything that would touch GitHub, systemd or the network.
+ACTIONS="${SAMPLES}/actions"
+# shellcheck disable=SC2317,SC2329
+install_runner() { echo "install $1 $2" >>"${ACTIONS}"; }
+# shellcheck disable=SC2317,SC2329
+remove_runner() { echo "remove ${1##*/}" >>"${ACTIONS}"; [[ -z ${FAIL_REMOVE:-} ]]; }
+# shellcheck disable=SC2317,SC2329
+reregister_runner() { echo "reregister ${1##*/} $2" >>"${ACTIONS}"; }
+# shellcheck disable=SC2317,SC2329
+download_runner() { echo "/tmp/archive.tar.gz"; }
+# shellcheck disable=SC2317,SC2329
+busy_units() { echo "unit-2"; }
+# shellcheck disable=SC2317,SC2329
+token_available() { [[ -z ${NO_TOKEN:-} ]]; }
+
+# Runs resize_repository for <repo> and prints the summary rows, then the to-do list.
+resize_sample() {
+  : >"${ACTIONS}"
+  resize_repository "$1" >/dev/null
+  printf '%s\n' "${RESIZE_ROWS[@]}"
+  printf 'TODO %s\n' "${RESIZE_TODO[@]}"
+}
+
+RESULT="$(RUNNER_COUNT=1 resize_sample Sna-ke/GroundCore)"
+check "shrink: relabel runner 1, remove idle 10, keep busy 2" "vps-groundcore-1	labels groundcore-ci -> groundcore-ci,groundcore-stack	done
+vps-groundcore-10	remove (machine fits 1)	done
+vps-groundcore-2	remove (machine fits 1)	not done
+TODO vps-groundcore-2 (remove (machine fits 1)): it is running a job, and removing it now would cancel the job. \
+Run 'sudo ghrunner resize' again once 'ghrunner status' shows it idle." "${RESULT}"
+check "shrink: what it did" $'reregister groundcore-1 groundcore-ci,groundcore-stack\nremove groundcore-10' "$(<"${ACTIONS}")"
+
+RESULT="$(RUNNER_COUNT=3 NO_TOKEN=1 resize_sample Sna-ke/GroundCore)"
+check "grow without a token: reports, changes nothing" "vps-groundcore-1	labels groundcore-ci -> groundcore-ci,groundcore-stack	not done
+vps-groundcore-2	check labels	unknown
+vps-groundcore-3	add	not done
+vps-groundcore-10	remove (machine fits 3)	not done" "$(grep -v '^TODO' <<<"${RESULT}")"
+check "grow without a token: every gap has a why and how" "4" "$(grep -c '^TODO .*: ' <<<"${RESULT}")"
+check "grow without a token: nothing touched" "" "$(<"${ACTIONS}")"
+
+RESULT="$(RUNNER_COUNT=1 FAIL_REMOVE=1 resize_sample Sna-ke/GroundCore)"
+check "failed unregister says how to finish by hand" "1" \
+  "$(grep -c "TODO vps-groundcore-10 .*Settings > Actions > Runners.*sudo rm -rf ${RUNNER_HOME}/groundcore-10" <<<"${RESULT}")"
+
+sample_runner groundcore-1 Sna-ke/GroundCore groundcore-stack,groundcore-ci unit-1
+rm -rf "${RUNNER_HOME}/groundcore-2" "${RUNNER_HOME}/groundcore-10"
+RESULT="$(RUNNER_COUNT=2 resize_sample Sna-ke/GroundCore)"
+check "grow: keeps runner 1, adds runner 2" $'vps-groundcore-1\tkeep\tlabels groundcore-ci,groundcore-stack\nvps-groundcore-2\tadd\tdone' \
+  "$(grep -v '^TODO' <<<"${RESULT}")"
+check "grow: installed runner 2" "install Sna-ke/GroundCore 2" "$(<"${ACTIONS}")"
+# Runs resize_report with one unfinished step.
+report_with_todo() {
+  RESIZE_ROWS=($'vps-a-1\tadd\tnot done')
+  RESIZE_TODO=("vps-a-1 (add): why and how")
+  resize_report
+}
+check "resize report fails when work is left" "fails" "$(outcome report_with_todo)"
+check "resize report lists why and how" "1. vps-a-1 (add): why and how" "$(report_with_todo | tail -n 1)"
+unset -f install_runner remove_runner reregister_runner download_runner busy_units token_available
 
 # ---------------------------------------------------------------------------------------------
 # status and stats end to end, with systemd, the journal and processes replaced by samples

@@ -28,13 +28,39 @@ running the host day to day.
 
 ## Sizing
 
-| Memory | Runners per repository | `<repo>-stack` label | Swap |
-| --- | --- | --- | --- |
-| Under 6 GB (e.g. OVH VPS-1) | 1 | No: the GroundCore stack job stays on GitHub's runners | 4 GB |
-| 6 to 9 GB (e.g. VPS-2) | 1 | Yes | 4 GB |
-| 10 GB or more (e.g. VPS-3) | 2 | Yes, on the first | None |
+Each runner gets at least 5 GB of memory and 3 cores, and there is always at least one per repository. The first
+runner gets the `<repo>-stack` label from 6 GB, and machines under 10 GB get swap.
+
+| Machine (OVH) | Cores, memory | Runners per repository | `<repo>-stack` label | Swap |
+| --- | --- | --- | --- | --- |
+| VPS-1 | 2, 4 GB | 1 | No: the GroundCore stack job stays on GitHub's runners | 4 GB |
+| VPS-2 | 4, 8 GB | 1 | Yes | 4 GB |
+| VPS-3 | 6, 12 GB | 2 | Yes, on the first | None |
+| VPS-4 | 8, 24 GB | 2 (cores are the limit) | Yes, on the first | None |
 
 Override with `RUNNER_COUNT`, `STACK_LABEL=yes|no` and `SWAP_SIZE_GB`.
+
+## Resizing the VM
+
+After changing the VM's size, run `sudo --preserve-env=GITHUB_TOKEN ghrunner resize`. `ghrunner doctor` warns when
+the runners no longer match the machine. For every repository with runners here, `resize`:
+
+1. Adds runners the machine now fits.
+2. Gives runner 1 the `<repo>-stack` label, or takes it away, by registering it again in its own folder.
+3. Removes runners above the count, highest number first.
+
+Whatever it can't do, it lists under "Still to do" with the reason and how to finish, then exits 1:
+
+| Reason | How to finish |
+| --- | --- |
+| The runner is running a job (removing or relabelling it would cancel the job) | Run `resize` again once `ghrunner status` shows it idle |
+| No token: no `GITHUB_TOKEN` and no terminal to paste one into | Run it with `GITHUB_TOKEN` set, or from a terminal |
+| GitHub refused to unregister it | The exact commands to remove it by hand, once it's gone from Settings > Actions > Runners |
+| Its labels are unknown (registered before ghrunner recorded them in the runner's `.labels` file) | Run it with `GITHUB_TOKEN` set, so ghrunner reads them from GitHub |
+
+`resize` applies the sizing rule to every repository, including one given a different count with
+`ghrunner add <repo> <count>`. To keep a different count, set `RUNNER_COUNT` when running it. Running
+`setup-runner.sh` again does the same as `resize`, for `RUNNER_REPOS` and every repository already on the machine.
 
 ## Run it
 
@@ -74,11 +100,12 @@ A host set up before `ghrunner` existed gets it, and the clean-up job's journal 
 | --- | --- | --- |
 | `ghrunner add <repo> [count]` | Registers runners 1 to `count` for a repository, with the usual folders, names and labels. `count` defaults to the Sizing rule above. Runners that exist are kept | Yes |
 | `ghrunner delete <repo>` | Stops, uninstalls and unregisters that repository's runners, then deletes their folders | Yes |
+| `ghrunner resize [repo]` | After a VM resize: adds, relabels and removes runners to match the Sizing rule. Lists anything it couldn't do, with why and how, and exits 1 (see Resizing the VM) | Yes |
 | `ghrunner update` | Upgrades system packages and says whether a reboot is needed; compares each runner's version with the latest release (runners update themselves, so this only reports) | Yes |
 | `ghrunner status` | Each runner: service state, idle or busy, and the job it is running | No |
 | `ghrunner stats [days]` | From the journal, for the last 7 days or `days`: jobs started and completed, results and average time, per runner and per repository. Then disk use of `/` and Docker, memory, swap, the last clean-up and the last reboot | No |
 | `ghrunner prune` | Runs the weekly clean-up now and shows the space freed | Yes |
-| `ghrunner doctor` | Checks disk (warn under 20% free, fail under 10%), Docker, every runner service, tool locations, the clean-up job, the firewall, SSH keys only, a pending reboot and swap. Prints PASS/WARN/FAIL and exits 1 on any FAIL | No |
+| `ghrunner doctor` | Checks disk (warn under 20% free, fail under 10%), Docker, every runner service, sizing, tool locations, the clean-up job, the firewall, SSH keys only, a pending reboot and swap. Prints PASS/WARN/FAIL and exits 1 on any FAIL | No |
 | `ghrunner help` | Lists the commands | No |
 
 `<repo>` is a repository name (owner `GITHUB_OWNER`, default `Sna-ke`) or `owner/repo`. `add` and `delete` get
@@ -138,7 +165,8 @@ any runner without them.
 
 Only a real runner host can test the rest:
 
-1. Registering and unregistering with GitHub (`add`, `delete`, `setup-runner.sh remove`).
+1. Registering, re-registering and unregistering with GitHub (`add`, `delete`, `resize`, `setup-runner.sh remove`),
+   and reading a runner's labels from GitHub.
 2. systemd: unit names as the runner's `svc.sh` writes them, service states, `Runner.Worker` cgroups (`status`).
 3. journald: the runner's real output lines and the clean-up job's log line (`status`, `stats`, `update`).
 4. Docker, apt, ufw, sshd and cron as they behave on Ubuntu 24.04 (`prune`, `update`, `doctor`).

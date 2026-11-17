@@ -323,15 +323,6 @@ docker_reachable() {
 # add / delete
 # ---------------------------------------------------------------------------------------------
 
-# True when a runner's "owner/repo" is the repository the user named: compares the whole name when
-# they gave an owner, else just the repository part. GitHub names ignore case.
-repository_matches() {
-  local wanted runner
-  wanted="$(tr '[:upper:]' '[:lower:]' <<<"$1")"
-  runner="$(tr '[:upper:]' '[:lower:]' <<<"$2")"
-  if [[ ${wanted} == */* ]]; then [[ ${runner} == "${wanted}" ]]; else [[ ${runner##*/} == "${wanted}" ]]; fi
-}
-
 # ghrunner add <repo> [count]: registers runners 1..count for a repository, with the same folders,
 # names and labels as setup-runner.sh. Existing runners are kept, so this also tops a repository up.
 add() {
@@ -373,12 +364,60 @@ delete() {
     if [[ -f ${directory}/.service ]] && unit_in_list "$(<"${directory}/.service")" "${busy}"; then
       note "it is running a job; stopping it cancels the job"
     fi
-    unregister_runner "${directory}"
-    rm -rf -- "${directory}"
+    remove_runner "${directory}"
     note "unregistered and its folder removed"
     deleted=$((deleted + 1))
   done
   ((deleted > 0)) || die "no runners for ${full} on this machine"
+}
+
+# ---------------------------------------------------------------------------------------------
+# resize
+# ---------------------------------------------------------------------------------------------
+
+# Prints the summary of a resize and, if anything couldn't be done, a numbered list saying why and how
+# to finish. Fails in that case, so resize exits 1.
+resize_report() {
+  local item number=0
+  log "Summary"
+  { printf 'RUNNER\tCHANGE\tRESULT\n'; printf '%s\n' "${RESIZE_ROWS[@]}"; } | print_table
+  ((${#RESIZE_TODO[@]} > 0)) || return 0
+  log "Still to do"
+  for item in "${RESIZE_TODO[@]}"; do
+    number=$((number + 1))
+    printf '%d. %s\n' "${number}" "${item}"
+  done
+  return 1
+}
+
+# ghrunner resize [repo]: after the VM changes size, matches every repository's runners (or one
+# repository's) to what the machine fits now: adds runners, fixes the stack label, and removes runners
+# above the count. Whatever it can't do is listed with why and how, and it exits 1.
+resize() {
+  require_root
+  [[ $# -le 1 ]] || die "usage: ghrunner resize [repo]"
+  local full
+  local -a repositories=()
+  id "${RUNNER_USER}" >/dev/null 2>&1 || die "there is no ${RUNNER_USER} user: run setup-runner.sh first"
+  if [[ $# -eq 1 ]]; then
+    full="$(full_repository_name "$1")" || exit 1
+    repositories=("${full}")
+  else
+    mapfile -t repositories < <(repositories_with_runners)
+  fi
+  if ((${#repositories[@]} == 0)); then
+    note "No runners on this machine. Add some with: sudo ghrunner add <repo>"
+    return
+  fi
+  resolve_runner_settings
+  log "This machine: $(memory_gb) GB, $(cpu_count) cores"
+  note "fits ${RUNNER_COUNT} runner(s) per repository; stack label ${STACK_LABEL}"
+  for full in "${repositories[@]}"; do
+    resize_repository "${full}"
+  done
+  log "Runner settings (.env)"
+  configure_runners
+  resize_report || exit 1
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -763,6 +802,46 @@ runners_missing_settings() {
   done | paste -sd, -
 }
 
+# From runner unit identities ("<name>\t<repo>\t<n>") on stdin, prints "<repo> has <n>" for each
+# repository whose runner count isn't <wanted>.
+count_mismatches() {
+  awk -F'\t' -v wanted="$1" '$2 != "unknown" { count[$2]++ }
+    END { for (repo in count) if (count[repo] != wanted) printf "%s has %d\n", repo, count[repo] }' | sort
+}
+
+# Lists runners (root only: .labels is in their folders) whose recorded labels differ from the rule.
+label_mismatches() {
+  local full index directory
+  while read -r full; do
+    while IFS=$'\t' read -r index directory; do
+      [[ -f ${directory}/.labels ]] || continue
+      if [[ "$(sort_labels <"${directory}/.labels")" != "$(expected_labels "$(repository_slug "${full}")" "${index}" | sort_labels)" ]]; then
+        echo "${directory##*/} labels"
+      fi
+    done < <(repository_runner_dirs "${full}")
+  done < <(repositories_with_runners)
+}
+
+# Sizing: after the VM is resized, the runners and stack label no longer match what it fits.
+check_sizing() {
+  local units problems
+  units="$(runner_units)"
+  if [[ -z ${units} ]]; then
+    record PASS "Sizing" "no runners"
+    return
+  fi
+  resolve_runner_settings
+  problems="$({
+    while IFS=$'\t' read -r unit _; do unit_identity "${unit}"; done <<<"${units}" | count_mismatches "${RUNNER_COUNT}"
+    if [[ ${EUID} -eq 0 ]]; then label_mismatches; fi
+  } | paste -sd, - | sed 's/,/, /g')"
+  if [[ -n ${problems} ]]; then
+    record WARN "Sizing" "machine fits ${RUNNER_COUNT} per repository; ${problems}: sudo ghrunner resize"
+  else
+    record PASS "Sizing" "${RUNNER_COUNT} runner(s) per repository fits $(memory_gb) GB, $(cpu_count) cores"
+  fi
+}
+
 # Tool locations: without them, setup-dotnet, setup-python and setup-ruby fail with "Permission denied".
 check_tool_settings() {
   local owner missing
@@ -807,6 +886,7 @@ doctor() {
   check_disk
   check_docker
   check_runner_services
+  check_sizing
   check_tool_settings
   check_cleanup_job
   check_firewall
@@ -829,6 +909,7 @@ Usage: ghrunner <command> [arguments]
 Commands                  What it does                                                    Needs sudo
   add <repo> [count]      register runners 1..count for a repository (count: auto)        yes
   delete <repo>           stop, unregister and remove a repository's runners              yes
+  resize [repo]           after a VM resize: add, relabel or remove runners to fit        yes
   update                  update system packages, report reboot and runner versions       yes
   status                  each runner: service, idle or busy, current job                 no
   stats [days]            jobs, results and durations (default 7 days), disk, memory      no
@@ -850,6 +931,7 @@ main() {
   case "${command}" in
     add) add "$@" ;;
     delete) delete "$@" ;;
+    resize) resize "$@" ;;
     update) update "$@" ;;
     status) status "$@" ;;
     stats) stats "$@" ;;
