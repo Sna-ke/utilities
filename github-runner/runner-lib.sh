@@ -24,6 +24,11 @@ DOWNLOAD_DIR="/var/cache/actions-runner"
 PRUNE_SCRIPT="/etc/cron.weekly/docker-prune"
 # shellcheck disable=SC2034 # read by the scripts that source this file
 GHRUNNER_LIB_DIR="/usr/local/lib/ghrunner"
+# Where "ghrunner self-update" gets new versions, and the files that make up one.
+# shellcheck disable=SC2034 # read by the scripts that source this file
+GHRUNNER_REPO="${GHRUNNER_REPO:-Sna-ke/utilities}"
+# shellcheck disable=SC2034 # read by the scripts that source this file
+GHRUNNER_FILES=(setup-runner.sh runner-lib.sh ghrunner.sh)
 TOOL_CACHE_DIR="/opt/hostedtoolcache"
 
 # Prints a step heading, so long runs show where they are.

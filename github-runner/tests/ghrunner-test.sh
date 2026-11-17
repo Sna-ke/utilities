@@ -360,6 +360,44 @@ check "resize report lists why and how" "1. vps-a-1 (add): why and how" "$(repor
 unset -f install_runner remove_runner reregister_runner download_runner busy_units token_available
 
 # ---------------------------------------------------------------------------------------------
+# version and self-update
+# ---------------------------------------------------------------------------------------------
+
+mkdir -p "${SAMPLES}/installed"
+printf 'echo one\n' >"${SAMPLES}/installed/setup-runner.sh"
+printf '' >"${SAMPLES}/installed/runner-lib.sh"
+printf 'tab\there\0nul\n' >"${SAMPLES}/installed/ghrunner.sh"
+if command -v git >/dev/null; then
+  for file in setup-runner.sh runner-lib.sh ghrunner.sh; do
+    check "blob hash matches git: ${file}" "$(git hash-object "${SAMPLES}/installed/${file}")" \
+      "$(git_blob_sha "${SAMPLES}/installed/${file}")"
+  done
+fi
+COMMITS_JSON="$(jq -cn '[
+  {sha: ("c" * 40), commit: {committer: {date: "2026-11-20T10:00:00Z"}, message: "Newest change\n\nBody text"}},
+  {sha: ("b" * 40), commit: {committer: {date: "2026-11-18T10:00:00Z"}, message: "Middle change"}},
+  {sha: ("a" * 40), commit: {committer: {date: "2026-11-17T10:00:00Z"}, message: "Installed one"}}]')"
+COMMITS="$(parse_commits <<<"${COMMITS_JSON}")"
+check "commit list" "$(printf 'c%.0s' {1..40})	2026-11-20	Newest change" "$(head -n 1 <<<"${COMMITS}")"
+check "changes since the installed commit" "ccccccc  2026-11-20  Newest change
+bbbbbbb  2026-11-18  Middle change" "$(commits_since "$(printf 'a%.0s' {1..40})" <<<"${COMMITS}")"
+check "changes since an unknown commit: newest ones" "3" "$(commits_since unknown <<<"${COMMITS}" | wc -l | tr -d ' ')"
+
+BLOBS_JSON="$(jq -cn --arg s "$(git_blob_sha "${SAMPLES}/installed/setup-runner.sh")" \
+  --arg l "$(git_blob_sha "${SAMPLES}/installed/runner-lib.sh")" --arg g "$(git_blob_sha "${SAMPLES}/installed/ghrunner.sh")" '[
+  {name: "README.md", type: "file", sha: "0000"}, {name: "tests", type: "dir", sha: "1111"},
+  {name: "setup-runner.sh", type: "file", sha: $s}, {name: "runner-lib.sh", type: "file", sha: $l},
+  {name: "ghrunner.sh", type: "file", sha: $g}]')"
+BLOBS="$(parse_blobs <<<"${BLOBS_JSON}")"
+check "file list skips folders" "4" "$(wc -l <<<"${BLOBS}" | tr -d ' ')"
+check "installed files match" "ok" "$(outcome files_match "${SAMPLES}/installed" "${BLOBS}")"
+printf 'echo two\n' >"${SAMPLES}/installed/setup-runner.sh"
+check "a changed file doesn't match" "fails" "$(outcome files_match "${SAMPLES}/installed" "${BLOBS}")"
+check "a missing file doesn't match" "fails" "$(outcome files_match "${SAMPLES}/nowhere" "${BLOBS}")"
+check "an empty listing doesn't match" "fails" "$(outcome files_match "${SAMPLES}/installed" "")"
+check "self-update without root" "fails" "$(outcome bash "${TESTS_DIR}/../ghrunner.sh" self-update --bogus)"
+
+# ---------------------------------------------------------------------------------------------
 # status and stats end to end, with systemd, the journal and processes replaced by samples
 # ---------------------------------------------------------------------------------------------
 

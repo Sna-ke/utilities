@@ -24,7 +24,7 @@ running the host day to day.
 | Clean-up | Weekly `docker system prune` (`/etc/cron.weekly/docker-prune`), logged to the journal |
 | Runners | Latest release, SHA-256 checked, one systemd service each, as the `runner` user |
 | Tool locations | Each runner's `.env` tells setup actions where to install tools (see below). Existing runners get it too |
-| `ghrunner` | `/usr/local/bin/ghrunner`, with its shared code in `/usr/local/lib/ghrunner/` |
+| `ghrunner` | `/usr/local/bin/ghrunner`. `/usr/local/lib/ghrunner/` holds copies of all three files and `VERSION`, the commit they came from |
 
 ## Sizing
 
@@ -106,6 +106,8 @@ A host set up before `ghrunner` existed gets it, and the clean-up job's journal 
 | `ghrunner stats [days]` | From the journal, for the last 7 days or `days`: jobs started and completed, results and average time, per runner and per repository. Then disk use of `/` and Docker, memory, swap, the last clean-up and the last reboot | No |
 | `ghrunner prune` | Runs the weekly clean-up now and shows the space freed | Yes |
 | `ghrunner doctor` | Checks disk (warn under 20% free, fail under 10%), Docker, every runner service, sizing, tool locations, the clean-up job, the firewall, SSH keys only, a pending reboot and swap. Prints PASS/WARN/FAIL and exits 1 on any FAIL | No |
+| `ghrunner version` | The installed commit, the latest on `main`, and whether they match | No |
+| `ghrunner self-update [--yes]` | Updates to the latest `main`, after listing what changed (see Updating) | Yes |
 | `ghrunner help` | Lists the commands | No |
 
 `<repo>` is a repository name (owner `GITHUB_OWNER`, default `Sna-ke`) or `owner/repo`. `add` and `delete` get
@@ -120,6 +122,25 @@ ghrunner stats 30
 Without sudo, the read-only commands show what an ordinary user can see. Job names, runner versions and the last
 clean-up come from the journal, which needs sudo or membership of the `adm` group (Ubuntu's default admin user
 has it). Docker disk use needs sudo or the `docker` group.
+
+## Updating
+
+```sh
+read -rsp "Token: " GITHUB_TOKEN && export GITHUB_TOKEN   # so nothing stops to ask for one
+sudo --preserve-env=GITHUB_TOKEN ghrunner self-update
+```
+
+1. Finds the latest commit on `main` that changed `github-runner/`, and stops if the installed files already
+   match it.
+2. Lists the changes since the installed commit and asks before going on. Use `--yes` to skip the question
+   (for example, from cron).
+3. Downloads all three files from that exact commit, so they always match each other, and checks each against
+   the hash GitHub reports for it.
+4. Runs that version's `setup-runner.sh`, the same as updating by hand: packages, `ghrunner`, runner settings and
+   sizing. Its summary lists anything left to do.
+
+`ghrunner doctor` warns when `main` has a newer version. A host installed before `self-update` existed needs one
+update by hand: download the three files as in step 3 of "Run it" and run `setup-runner.sh` again.
 
 ## Other commands
 
@@ -170,6 +191,8 @@ Only a real runner host can test the rest:
 2. systemd: unit names as the runner's `svc.sh` writes them, service states, `Runner.Worker` cgroups (`status`).
 3. journald: the runner's real output lines and the clean-up job's log line (`status`, `stats`, `update`).
 4. Docker, apt, ufw, sshd and cron as they behave on Ubuntu 24.04 (`prune`, `update`, `doctor`).
+5. A full `self-update` (it runs `setup-runner.sh`). Its version check, hashes and download were tested against
+   this repository on GitHub.
 
 A first run on a new host: `ghrunner doctor`, `ghrunner status` while a job runs, `sudo ghrunner prune`, then
 `ghrunner stats` after a few jobs.
