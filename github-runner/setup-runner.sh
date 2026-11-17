@@ -212,13 +212,25 @@ EOF
   chmod +x "${PRUNE_SCRIPT}"
 }
 
-# Installs the management command and the file it shares with this script. Copies, not links, so
-# deleting the download folder doesn't break it; running this again just replaces them.
+# Installs the management command, plus copies of all three files in /usr/local/lib/ghrunner, so
+# "ghrunner self-update" can tell which version is installed. Records the commit they came from (given
+# by self-update as GHRUNNER_COMMIT; "unknown" for a download by hand). Copies, not links, so deleting
+# the download folder doesn't break it; running this again just replaces them.
 install_ghrunner() {
+  local file
   log "Installing the ghrunner command"
-  install -D -m 0644 "${SCRIPT_DIR}/runner-lib.sh" "${GHRUNNER_LIB_DIR}/runner-lib.sh"
+  install -d -m 0755 "${GHRUNNER_LIB_DIR}"
+  if [[ ${SCRIPT_DIR} != "${GHRUNNER_LIB_DIR}" ]]; then
+    for file in "${GHRUNNER_FILES[@]}"; do
+      install -m 0644 "${SCRIPT_DIR}/${file}" "${GHRUNNER_LIB_DIR}/${file}"
+    done
+  fi
   install -m 0755 "${SCRIPT_DIR}/ghrunner.sh" /usr/local/bin/ghrunner
-  note "run 'ghrunner help' for its commands"
+  # Re-running the installed copy keeps the recorded commit: the files are the same ones.
+  if [[ -n ${GHRUNNER_COMMIT:-} || ${SCRIPT_DIR} != "${GHRUNNER_LIB_DIR}" || ! -f ${GHRUNNER_LIB_DIR}/VERSION ]]; then
+    echo "${GHRUNNER_COMMIT:-unknown}" >"${GHRUNNER_LIB_DIR}/VERSION"
+  fi
+  note "version $(<"${GHRUNNER_LIB_DIR}/VERSION"); run 'ghrunner help' for its commands"
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -238,10 +250,6 @@ create_runner_user() {
   visudo -cqf "${sudoers}.new" || die "sudoers file failed its check"
   chmod 440 "${sudoers}.new"
   mv "${sudoers}.new" "${sudoers}"
-
-  # actions/setup-dotnet installs into /usr/share/dotnet, which GitHub's own images make writable.
-  # Without this, every .NET job fails with "cannot create directory '/usr/share/dotnet'".
-  install -d -o "${RUNNER_USER}" -g "${RUNNER_USER}" /usr/share/dotnet
 }
 
 # ---------------------------------------------------------------------------------------------

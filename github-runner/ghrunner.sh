@@ -421,6 +421,146 @@ resize() {
 }
 
 # ---------------------------------------------------------------------------------------------
+# version and self-update
+#
+# A version is a commit of GHRUNNER_REPO. Files are compared by their git blob hash, which GitHub
+# reports for every file, so a copy downloaded by hand is recognised too.
+# ---------------------------------------------------------------------------------------------
+
+# Prints the git blob hash of a file (what "git hash-object" prints), to compare it with GitHub's.
+git_blob_sha() {
+  { printf 'blob %d\0' "$(stat -c %s "$1")"; cat "$1"; } | sha1sum | cut -d' ' -f1
+}
+
+# Calls GitHub's API for GHRUNNER_REPO (public, so no token; GITHUB_TOKEN is for the runner repositories).
+github_api() {
+  curl -fsSL --max-time 20 -H "Accept: application/vnd.github+json" \
+    "https://api.github.com/repos/${GHRUNNER_REPO}/$1"
+}
+
+# From GitHub's commit list on stdin, prints "<sha>\t<date>\t<title>" for each commit, newest first.
+parse_commits() {
+  jq -r '.[] | [.sha, (.commit.committer.date | .[0:10]), (.commit.message | split("\n")[0])] | join("\t")'
+}
+
+# Prints the commits on main that changed github-runner/, newest first (up to 30).
+latest_commits() {
+  github_api "commits?sha=main&path=github-runner&per_page=30" | parse_commits
+}
+
+# From a folder listing (GitHub's contents API) on stdin, prints "<name>\t<blob sha>" for each file.
+parse_blobs() {
+  jq -r '.[] | select(.type == "file") | [.name, .sha] | join("\t")'
+}
+
+# Prints "<name>\t<blob sha>" for github-runner's files at <commit>.
+blobs_at() {
+  github_api "contents/github-runner?ref=$1" | parse_blobs
+}
+
+# The commit recorded at install, or "unknown".
+installed_commit() {
+  local commit=""
+  if [[ -r ${GHRUNNER_LIB_DIR}/VERSION ]]; then commit="$(<"${GHRUNNER_LIB_DIR}/VERSION")"; fi
+  echo "${commit:-unknown}"
+}
+
+# True when every file in <folder> matches the blob hashes ("<name>\t<sha>" lines) given.
+files_match() {
+  local folder="$1" blobs="$2" file want
+  for file in "${GHRUNNER_FILES[@]}"; do
+    want="$(awk -F'\t' -v name="${file}" '$1 == name { print $2 }' <<<"${blobs}")"
+    [[ -n ${want} && -f ${folder}/${file} && "$(git_blob_sha "${folder}/${file}")" == "${want}" ]] || return 1
+  done
+}
+
+# From commits ("<sha>\t<date>\t<title>", newest first) on stdin, prints the ones newer than <installed>
+# as "<short sha>  <date>  <title>". With an unknown or unlisted installed commit, prints the newest 5.
+commits_since() {
+  awk -F'\t' -v installed="$1" '
+    $1 == installed { found = 1; exit }
+    { line[++count] = substr($1, 1, 7) "  " $2 "  " $3 }
+    END { for (i = 1; i <= count && (found || i <= 5); i++) print line[i] }'
+}
+
+# ghrunner version: the installed commit, the latest on main, and whether they match.
+version() {
+  no_arguments "$@"
+  local commits latest blobs state
+  commits="$(latest_commits 2>/dev/null || true)"
+  latest="$(head -n 1 <<<"${commits}" | cut -f1)"
+  if [[ -z ${latest} ]]; then
+    state="can't tell: GitHub didn't answer"
+  else
+    blobs="$(blobs_at "${latest}" 2>/dev/null || true)"
+    if files_match "${GHRUNNER_LIB_DIR}" "${blobs}"; then state="up to date"; else state="update available: sudo ghrunner self-update"; fi
+  fi
+  {
+    printf 'ITEM\tVALUE\n'
+    printf 'Installed\t%s\n' "$(installed_commit | cut -c1-7)"
+    printf 'Latest on main\t%s\n' "$(head -n 1 <<<"${commits}" | awk -F'\t' '{ print substr($1, 1, 7) "  " $2 "  " $3 }')"
+    printf 'Status\t%s\n' "${state}"
+  } | print_table
+}
+
+# Asks a yes/no question on the terminal; anything but "y" or "yes" is no.
+confirm() {
+  local answer
+  printf '%s [y/N] ' "$1" >/dev/tty
+  read -r answer </dev/tty
+  [[ ${answer,,} == "y" || ${answer,,} == "yes" ]]
+}
+
+# Downloads github-runner's files at <commit> into <folder> and checks each against GitHub's blob hash,
+# so a cut-off or mixed download never runs.
+download_version() {
+  local commit="$1" folder="$2" blobs="$3" file
+  for file in "${GHRUNNER_FILES[@]}"; do
+    curl -fsSL --max-time 60 -o "${folder}/${file}" \
+      "https://raw.githubusercontent.com/${GHRUNNER_REPO}/${commit}/github-runner/${file}"
+  done
+  files_match "${folder}" "${blobs}" || die "the downloaded files don't match GitHub's hashes for ${commit}"
+}
+
+# ghrunner self-update [--yes]: when main has a newer version, lists what changed, asks, downloads all
+# three files from that exact commit, and runs its setup-runner.sh: the same as updating by hand.
+self_update() {
+  require_root
+  local assume_yes="no" commits latest blobs folder
+  case "${1:-}" in
+    "") ;;
+    --yes | -y) assume_yes="yes" ;;
+    *) die "usage: ghrunner self-update [--yes]" ;;
+  esac
+  log "Checking ${GHRUNNER_REPO} for a newer version"
+  commits="$(latest_commits)" || die "couldn't reach GitHub"
+  latest="$(head -n 1 <<<"${commits}" | cut -f1)"
+  [[ ${latest} =~ ^[0-9a-f]{40}$ ]] || die "GitHub's answer had no commit"
+  blobs="$(blobs_at "${latest}")" || die "couldn't list the files at ${latest}"
+  if files_match "${GHRUNNER_LIB_DIR}" "${blobs}"; then
+    echo "${latest}" >"${GHRUNNER_LIB_DIR}/VERSION"
+    note "already up to date (${latest:0:7})"
+    return
+  fi
+  note "installed: $(installed_commit | cut -c1-7)    latest: ${latest:0:7}"
+  log "Changes"
+  commits_since "$(installed_commit)" <<<"${commits}" | sed 's/^/    /'
+  note "Updating runs setup-runner.sh again: packages, ghrunner, runner settings and sizing."
+  if [[ ${assume_yes} != "yes" ]]; then
+    { true </dev/tty; } 2>/dev/null || die "no terminal to confirm on: run 'sudo ghrunner self-update --yes'"
+    confirm "Update to ${latest:0:7}?" || die "not updated"
+  fi
+
+  folder="$(mktemp -d)"
+  # shellcheck disable=SC2064 # expand now: the folder is local to this function
+  trap "rm -rf '${folder}'" EXIT
+  log "Downloading ${latest:0:7}"
+  download_version "${latest}" "${folder}" "${blobs}"
+  note "all files match GitHub's hashes"
+  GHRUNNER_COMMIT="${latest}" bash "${folder}/setup-runner.sh"
+}
+
+# ---------------------------------------------------------------------------------------------
 # update
 # ---------------------------------------------------------------------------------------------
 
@@ -842,6 +982,22 @@ check_sizing() {
   fi
 }
 
+# ghrunner itself: a newer version on main may fix problems this machine has.
+check_ghrunner_version() {
+  local latest blobs
+  latest="$(latest_commits 2>/dev/null | head -n 1 | cut -f1 || true)"
+  if [[ -z ${latest} ]]; then
+    record WARN "ghrunner version" "couldn't reach GitHub to check"
+    return
+  fi
+  blobs="$(blobs_at "${latest}" 2>/dev/null || true)"
+  if files_match "${GHRUNNER_LIB_DIR}" "${blobs}"; then
+    record PASS "ghrunner version" "up to date (${latest:0:7})"
+  else
+    record WARN "ghrunner version" "newer version on main (${latest:0:7}): sudo ghrunner self-update"
+  fi
+}
+
 # Tool locations: without them, setup-dotnet, setup-python and setup-ruby fail with "Permission denied".
 check_tool_settings() {
   local owner missing
@@ -893,6 +1049,7 @@ doctor() {
   check_ssh
   check_reboot
   check_swap
+  check_ghrunner_version
   { printf 'CHECK\tRESULT\tDETAIL\n'; printf '%s\n' "${DOCTOR_ROWS[@]}"; } | print_table
   if ((DOCTOR_FAILED)); then exit 1; fi
 }
@@ -906,16 +1063,18 @@ usage() {
   cat <<'EOF'
 Usage: ghrunner <command> [arguments]
 
-Commands                  What it does                                                    Needs sudo
-  add <repo> [count]      register runners 1..count for a repository (count: auto)        yes
-  delete <repo>           stop, unregister and remove a repository's runners              yes
-  resize [repo]           after a VM resize: add, relabel or remove runners to fit        yes
-  update                  update system packages, report reboot and runner versions       yes
-  status                  each runner: service, idle or busy, current job                 no
-  stats [days]            jobs, results and durations (default 7 days), disk, memory      no
-  prune                   run the weekly Docker clean-up now, show the space freed        yes
-  doctor                  health checks as a PASS/WARN/FAIL table; exits 1 on a FAIL      no
-  help                    this text                                                       no
+Commands               What it does                                                     Needs sudo
+  add <repo> [count]   register runners 1..count for a repository (count: auto)         yes
+  delete <repo>        stop, unregister and remove a repository's runners               yes
+  resize [repo]        after a VM resize: add, relabel or remove runners to fit         yes
+  update               update system packages, report reboot and runner versions        yes
+  status               each runner: service, idle or busy, current job                  no
+  stats [days]         jobs, results and durations (default 7 days), disk, memory       no
+  prune                run the weekly Docker clean-up now, show the space freed         yes
+  doctor               health checks as a PASS/WARN/FAIL table; exits 1 on a FAIL       no
+  version              installed version, and whether main has a newer one              no
+  self-update [--yes]  update ghrunner and setup from main, after showing what changed  yes
+  help                 this text                                                        no
 
 <repo> is "repo" (owner: GITHUB_OWNER, default Sna-ke) or "owner/repo", e.g. example-org/example-app.
 add and delete get tokens from GITHUB_TOKEN (fine-grained, Administration: read and write; never
@@ -937,6 +1096,8 @@ main() {
     stats) stats "$@" ;;
     prune) prune "$@" ;;
     doctor) doctor "$@" ;;
+    version | --version) version "$@" ;;
+    self-update) self_update "$@" ;;
     help | -h | --help) usage ;;
     *) usage >&2 && die "unknown command '${command}'" ;;
   esac
