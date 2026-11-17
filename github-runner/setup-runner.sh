@@ -132,8 +132,15 @@ PasswordAuthentication no
 KbdInteractiveAuthentication no
 PermitRootLogin prohibit-password
 EOF
-  sshd -t || die "the new SSH settings failed sshd's check; nothing was reloaded"
-  systemctl reload ssh
+  # Ubuntu 24.04 starts sshd on demand (ssh.socket), so its privilege separation directory may not
+  # exist yet, and "sshd -t" fails without it.
+  install -d -m 0755 /run/sshd
+  if ! sshd -t; then
+    rm -f /etc/ssh/sshd_config.d/10-runner-host.conf
+    die "the new SSH settings failed sshd's check; they were removed and nothing was reloaded"
+  fi
+  # Reloads a running sshd; with socket activation an idle sshd reads the new settings on its next start.
+  systemctl try-reload-or-restart ssh
   note "password login is off"
 }
 
