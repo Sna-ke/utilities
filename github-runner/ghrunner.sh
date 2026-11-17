@@ -381,9 +381,9 @@ resize_report() {
   local item number=0
   log "Summary"
   { printf 'RUNNER\tCHANGE\tRESULT\n'; printf '%s\n' "${RESIZE_ROWS[@]}"; } | print_table
-  ((${#RESIZE_TODO[@]} > 0)) || return 0
+  ((${#STILL_TO_DO[@]} > 0)) || return 0
   log "Still to do"
-  for item in "${RESIZE_TODO[@]}"; do
+  for item in "${STILL_TO_DO[@]}"; do
     number=$((number + 1))
     printf '%d. %s\n' "${number}" "${item}"
   done
@@ -427,37 +427,6 @@ resize() {
 # reports for every file, so a copy downloaded by hand is recognised too.
 # ---------------------------------------------------------------------------------------------
 
-# Prints the git blob hash of a file (what "git hash-object" prints), to compare it with GitHub's.
-git_blob_sha() {
-  { printf 'blob %d\0' "$(stat -c %s "$1")"; cat "$1"; } | sha1sum | cut -d' ' -f1
-}
-
-# Calls GitHub's API for GHRUNNER_REPO (public, so no token; GITHUB_TOKEN is for the runner repositories).
-github_api() {
-  curl -fsSL --max-time 20 -H "Accept: application/vnd.github+json" \
-    "https://api.github.com/repos/${GHRUNNER_REPO}/$1"
-}
-
-# From GitHub's commit list on stdin, prints "<sha>\t<date>\t<title>" for each commit, newest first.
-parse_commits() {
-  jq -r '.[] | [.sha, (.commit.committer.date | .[0:10]), (.commit.message | split("\n")[0])] | join("\t")'
-}
-
-# Prints the commits on main that changed github-runner/, newest first (up to 30).
-latest_commits() {
-  github_api "commits?sha=main&path=github-runner&per_page=30" | parse_commits
-}
-
-# From a folder listing (GitHub's contents API) on stdin, prints "<name>\t<blob sha>" for each file.
-parse_blobs() {
-  jq -r '.[] | select(.type == "file") | [.name, .sha] | join("\t")'
-}
-
-# Prints "<name>\t<blob sha>" for github-runner's files at <commit>.
-blobs_at() {
-  github_api "contents/github-runner?ref=$1" | parse_blobs
-}
-
 # The commit recorded at install, or "unknown" (setup-runner.sh run from a download by hand).
 installed_commit() {
   local commit=""
@@ -470,20 +439,6 @@ installed_version() {
   local version=""
   if [[ -r ${GHRUNNER_LIB_DIR}/runner-lib.sh ]]; then version="$(version_from_text <"${GHRUNNER_LIB_DIR}/runner-lib.sh")"; fi
   echo "${version:-1.2.0 or older}"
-}
-
-# Downloads one of github-runner's files at <commit> and prints it.
-file_at() {
-  curl -fsSL --max-time 60 "https://raw.githubusercontent.com/${GHRUNNER_REPO}/$1/github-runner/$2"
-}
-
-# True when every file in <folder> matches the blob hashes ("<name>\t<sha>" lines) given.
-files_match() {
-  local folder="$1" blobs="$2" file want
-  for file in "${GHRUNNER_FILES[@]}"; do
-    want="$(awk -F'\t' -v name="${file}" '$1 == name { print $2 }' <<<"${blobs}")"
-    [[ -n ${want} && -f ${folder}/${file} && "$(git_blob_sha "${folder}/${file}")" == "${want}" ]] || return 1
-  done
 }
 
 # From commits ("<sha>\t<date>\t<title>", newest first) on stdin, prints the ones newer than <installed>
@@ -544,25 +499,6 @@ version() {
     fi
     printf 'Status\t%s\n' "${state}"
   } | print_table
-}
-
-# Asks a yes/no question on the terminal; anything but "y" or "yes" is no.
-confirm() {
-  local answer
-  printf '%s [y/N] ' "$1" >/dev/tty
-  read -r answer </dev/tty
-  [[ ${answer,,} == "y" || ${answer,,} == "yes" ]]
-}
-
-# Downloads github-runner's files at <commit> into <folder> and checks each against GitHub's blob hash,
-# so a cut-off or mixed download never runs.
-download_version() {
-  local commit="$1" folder="$2" blobs="$3" file
-  for file in "${GHRUNNER_FILES[@]}"; do
-    curl -fsSL --max-time 60 -o "${folder}/${file}" \
-      "https://raw.githubusercontent.com/${GHRUNNER_REPO}/${commit}/github-runner/${file}"
-  done
-  files_match "${folder}" "${blobs}" || die "the downloaded files don't match GitHub's hashes for ${commit}"
 }
 
 # Prints what changed between the installed version and <latest commit>: the changelog entries when
@@ -638,16 +574,100 @@ reboot_state() {
   fi
 }
 
-# ghrunner update: system packages, reboot check, and each runner's version against the latest release.
-# Runners update themselves, so they are only reported.
+# From kernel image names (vmlinuz-<version>) on stdin, prints the newest version.
+newest_kernel() {
+  sed -n 's/^vmlinuz-//p' | sort -V | tail -n 1
+}
+
+# Prints the newest installed kernel when it is newer than the running one (it waits for a reboot),
+# else nothing.
+kernel_waiting() {
+  local running newest
+  running="$(uname -r)"
+  newest="$(find /boot -maxdepth 1 -name 'vmlinuz-*' -printf '%f\n' 2>/dev/null | newest_kernel || true)"
+  if [[ -n ${newest} ]] && version_newer "${newest}" "${running}"; then echo "${newest}"; fi
+}
+
+# Waits until no runner is running a job, checking every minute for up to <minutes>. Fails if they
+# stay busy that long.
+wait_until_idle() {
+  local minutes="$1" waited=0
+  while [[ -n "$(busy_units)" ]]; do
+    ((waited < minutes)) || return 1
+    sleep 60
+    waited=$((waited + 1))
+  done
+}
+
+PAUSED_UNITS=()
+
+# Stops every running runner, so no job starts while packages (Docker among them) are upgraded.
+pause_runners() {
+  local unit active
+  while IFS=$'\t' read -r unit active; do
+    [[ ${active} == "active" ]] || continue
+    systemctl stop "${unit}"
+    PAUSED_UNITS+=("${unit}")
+  done < <(runner_units)
+}
+
+# Starts the runners pause_runners stopped.
+resume_runners() {
+  local unit
+  for unit in "${PAUSED_UNITS[@]}"; do systemctl start "${unit}" || true; done
+  PAUSED_UNITS=()
+}
+
+# Prints what needs a reboot, for people: a waiting kernel first, as that is the one that matters.
+reboot_reason() {
+  local kernel
+  kernel="$(kernel_waiting)"
+  if [[ -n ${kernel} ]]; then
+    echo "kernel ${kernel} is installed but $(uname -r) is running: reboot when convenient (sudo reboot; runners restart by themselves)"
+  elif [[ -f /var/run/reboot-required ]]; then
+    reboot_state
+  fi
+}
+
+# ghrunner update [--scheduled]: upgrades every package (Docker's too), never reboots, and warns when a
+# new kernel waits for a reboot; then compares each runner's version with the latest release (runners
+# update themselves, so this only reports). --scheduled (the weekly timer) first waits until no job is
+# running, pauses the runners during the upgrade, and alerts instead of printing.
 update() {
   require_root
-  no_arguments "$@"
-  local packages latest unit name version
+  local scheduled="no" packages reason latest unit name version
+  case "${1:-}" in
+    "") ;;
+    --scheduled) scheduled="yes" ;;
+    *) die "usage: ghrunner update [--scheduled]" ;;
+  esac
+  if [[ ${scheduled} == "yes" ]]; then
+    log "Waiting until no job is running (up to 3 hours)"
+    if ! wait_until_idle 180; then
+      send_alert "weekly update skipped" "Runners were busy for 3 hours. It tries again next week, or run: sudo ghrunner update"
+      exit 1
+    fi
+    trap 'resume_runners' EXIT
+    pause_runners
+    note "paused ${#PAUSED_UNITS[@]} runner(s) for the upgrade"
+  fi
+
   log "Updating system packages"
   packages="$(upgrade_packages)"
-  { printf 'ITEM\tRESULT\n'; printf 'Packages\t%s\n' "${packages}"; printf 'Reboot\t%s\n' "$(reboot_state)"; } |
+  if [[ ${scheduled} == "yes" ]]; then
+    resume_runners
+    trap - EXIT
+    note "runners started again"
+  fi
+  reason="$(reboot_reason)"
+  { printf 'ITEM\tRESULT\n'; printf 'Packages\t%s\n' "${packages}"; printf 'Reboot\t%s\n' "${reason:-not needed}"; } |
     print_table
+  if [[ -n ${reason} ]]; then
+    printf 'Reboot needed: %s\n' "${reason}" | set_attention reboot
+    if [[ ${scheduled} == "yes" && -n "$(kernel_waiting)" ]]; then send_alert "kernel update waiting" "${reason}"; fi
+  else
+    clear_attention reboot
+  fi
 
   log "Runner versions"
   latest="$(latest_runner_version)"
@@ -659,6 +679,248 @@ update() {
       printf '%s\t%s\t%s\t%s\n' "${name}" "${version}" "${latest}" "$(version_status "${version}" "${latest}")"
     done < <(runner_units)
   } | print_table
+}
+
+# ---------------------------------------------------------------------------------------------
+# audit: has anything changed that nobody accepted?
+#
+# setup-runner.sh records a baseline of everything that decides who can get in and what runs as root.
+# The daily timer compares the machine with it. A change nobody made is the sign this VM has been
+# tampered with; README.md says what to do then.
+# ---------------------------------------------------------------------------------------------
+
+AUDIT_BASELINE="${GHRUNNER_STATE_DIR}/audit-baseline"
+AUDIT_STATUS="${GHRUNNER_STATE_DIR}/audit-status"
+AUDIT_FORMAT="# ghrunner audit baseline, format 1"
+
+# From /etc/passwd on stdin: accounts that are root (UID 0), people (UID 1000 and up), or can log in.
+audit_users() {
+  awk -F: '$3 == 0 || ($3 >= 1000 && $3 < 65534) || $7 !~ /(nologin|false|sync|halt|shutdown)$/ {
+    printf "users\t%s\tuid=%s shell=%s\n", $1, $3, $7 }'
+}
+
+# Every SSH key that can log in to any account, by fingerprint.
+audit_ssh_keys() {
+  local user home file
+  while IFS=: read -r user _ _ _ _ home _; do
+    for file in "${home}/.ssh/authorized_keys" "${home}/.ssh/authorized_keys2"; do
+      [[ -s ${file} ]] || continue
+      ssh-keygen -lf "${file}" 2>/dev/null | awk -v user="${user}" '{ printf "ssh-keys\t%s %s\t%s\n", user, $2, $NF }' ||
+        printf 'ssh-keys\t%s %s\tunreadable\n' "${user}" "${file}"
+    done
+  done </etc/passwd
+}
+
+# Files given, by content hash, under <section> (sudo rules, cron jobs). Missing files are skipped.
+audit_files() {
+  local section="$1" file
+  shift
+  for file in "$@"; do
+    [[ -f ${file} ]] || continue
+    printf '%s\t%s\t%s\n' "${section}" "${file}" "$(sha256sum "${file}" | cut -c1-16)"
+  done
+}
+
+# The SSH settings that decide who gets in, from sshd itself.
+audit_ssh_settings() {
+  install -d -m 0755 /run/sshd
+  sshd -T 2>/dev/null | awk '$1 ~ /^(port|passwordauthentication|kbdinteractiveauthentication|permitrootlogin|pubkeyauthentication|authorizedkeysfile|allowusers|denyusers|allowgroups|permitemptypasswords)$/ {
+    printf "ssh-settings\t%s\t-\n", $0 }'
+}
+
+# The firewall: whether it is on, and every rule.
+audit_firewall() {
+  ufw status 2>/dev/null | awk 'NR == 1 { printf "firewall\t%s\t-\n", $0; next }
+    /^To / || /^--/ || NF == 0 { next } { gsub(/ +/, " "); printf "firewall\t%s\t-\n", $0 }'
+}
+
+# From "ss -Htlnu" on stdin, prints "<protocol> <port>" for every socket listening on an address other
+# than loopback: what the internet could reach if the firewall let it.
+public_listeners() {
+  awk '{
+    local_address = $5; port = local_address; sub(/.*:/, "", port)
+    address = substr(local_address, 1, length(local_address) - length(port) - 1)
+    gsub(/[][]/, "", address); sub(/%.*/, "", address)
+    if (address ~ /^127\./ || address == "::1") next
+    print $1 " " port
+  }' | sort -u
+}
+
+# Listening sockets reachable from outside.
+audit_listening() {
+  ss -Htlnu 2>/dev/null | public_listeners | awk '{ printf "listening\t%s\t-\n", $0 }'
+}
+
+# Services and timers that start by themselves. Runner services are left out: ghrunner adds and
+# removes those.
+audit_services() {
+  systemctl list-unit-files --state=enabled --no-legend --no-pager 2>/dev/null |
+    awk '$1 !~ /^actions\.runner\./ && $1 ~ /\.(service|timer|socket|path)$/ { printf "services\t%s\t-\n", $1 }'
+}
+
+# Programs that run with their owner's rights (setuid or setgid), outside the runners' folders and Docker.
+audit_setuid() {
+  find / -xdev \( -path /proc -o -path /sys -o -path "${RUNNER_HOME}" -o -path /var/lib/docker -o -path /snap \) -prune \
+    -o -type f -perm /6000 -print 2>/dev/null | awk '{ printf "setuid\t%s\t-\n", $0 }'
+}
+
+# ghrunner's own files, by hash: only setup-runner.sh should change them.
+audit_ghrunner() {
+  local file
+  for file in /usr/local/bin/ghrunner "${GHRUNNER_LIB_DIR}"/*.sh; do
+    if [[ -f ${file} ]]; then printf 'ghrunner\t%s\t%s\n' "${file}" "$(git_blob_sha "${file}" | cut -c1-16)"; fi
+  done
+}
+
+# From sshd's journal lines on stdin, prints "<user> from <address>" for each successful login.
+parse_logins() {
+  sed -nE 's/.*Accepted [^ ]+ for ([^ ]+) from ([^ ]+) port .*/\1 from \2/p' | sort -u
+}
+
+# Who logged in over SSH from where, in the last 8 days.
+audit_logins() {
+  journalctl -t sshd -t sshd-session --since "-8d" -o cat --no-pager 2>/dev/null | parse_logins |
+    awk '{ printf "logins\t%s\t-\n", $0 }'
+}
+
+# Everything the audit compares, one "<section>\t<item>\t<value>" line each, sorted. A piece that
+# fails leaves its section out rather than stopping the audit.
+audit_snapshot() {
+  {
+    audit_users </etc/passwd || true
+    audit_ssh_keys || true
+    audit_files sudo /etc/sudoers /etc/sudoers.d/* || true
+    audit_ssh_settings || true
+    audit_firewall || true
+    audit_listening || true
+    audit_files cron /etc/crontab /etc/cron.d/* /etc/cron.hourly/* /etc/cron.daily/* /etc/cron.weekly/* \
+      /etc/cron.monthly/* /var/spool/cron/crontabs/* || true
+    audit_services || true
+    audit_setuid || true
+    audit_ghrunner || true
+    audit_logins || true
+  } | LC_ALL=C sort -u
+}
+
+# Compares a baseline file with a snapshot file, printing "<section>\t<added|removed|changed>\t<item>"
+# for each difference. Logins only count when new: old ones age out of the journal.
+audit_diff() {
+  awk -F'\t' '
+    FNR == NR { if ($0 !~ /^#/) old[$1 FS $2] = $3; next }
+    /^#/ { next }
+    {
+      key = $1 FS $2; seen[key] = 1
+      if (!(key in old)) print $1 "\tadded\t" $2
+      else if (old[key] != $3) print $1 "\tchanged\t" $2
+    }
+    END {
+      for (key in old) if (!(key in seen)) {
+        split(key, part, FS)
+        if (part[1] != "logins") print part[1] "\tremoved\t" part[2]
+      }
+    }' "$1" "$2" | LC_ALL=C sort
+}
+
+# Makes a snapshot file the new baseline, keeping logins already known.
+audit_accept() {
+  local snapshot="$1"
+  install -d -m 0755 "${GHRUNNER_STATE_DIR}"
+  {
+    echo "${AUDIT_FORMAT}"
+    { cat "${snapshot}"; if [[ -f ${AUDIT_BASELINE} ]]; then awk -F'\t' '$1 == "logins"' "${AUDIT_BASELINE}"; fi; } |
+      LC_ALL=C sort -u
+  } >"${AUDIT_BASELINE}.new"
+  chmod 0600 "${AUDIT_BASELINE}.new"
+  mv "${AUDIT_BASELINE}.new" "${AUDIT_BASELINE}"
+}
+
+# Records an audit's result for doctor ("<epoch>\t<number of changes>") and the login message, and
+# alerts when the set of changes is new (not every day for the same ones).
+audit_record() {
+  local findings="$1" count=0 digest previous=""
+  [[ -z ${findings} ]] || count="$(wc -l <<<"${findings}")"
+  printf '%s\t%s\n' "$(date +%s)" "${count}" >"${AUDIT_STATUS}"
+  if ((count == 0)); then
+    clear_attention audit
+    rm -f "${GHRUNNER_STATE_DIR}/audit-alerted"
+    return
+  fi
+  {
+    printf 'Audit %s: %s change(s) nobody accepted, e.g.\n' "$(date '+%Y-%m-%d %H:%M')" "${count}"
+    head -n 5 <<<"${findings}" | sed 's/\t/ /g; s/^/  /'
+    printf 'If you made them: sudo ghrunner audit --accept. If not: see "If the VM is compromised" in the README.\n'
+  } | set_attention audit
+  digest="$(sha256sum <<<"${findings}" | cut -c1-16)"
+  if [[ -f ${GHRUNNER_STATE_DIR}/audit-alerted ]]; then previous="$(<"${GHRUNNER_STATE_DIR}/audit-alerted")"; fi
+  if [[ ${digest} != "${previous}" ]]; then
+    send_alert "audit found ${count} unexpected change(s)" "$(head -n 10 <<<"${findings}" | sed 's/\t/ /g')"
+    echo "${digest}" >"${GHRUNNER_STATE_DIR}/audit-alerted"
+  fi
+}
+
+# Prints audit findings as a table.
+audit_table() {
+  { printf 'SECTION\tCHANGE\tITEM\n'; printf '%s\n' "$1"; } | print_table
+}
+
+# ghrunner audit [--accept | --notify | --before-setup]: compares this machine with the baseline and
+# lists every change. Exits 1 if there are any.
+#   --accept        you made the changes: they become the new baseline
+#   --notify        the daily timer: records the result, shows it at login, and alerts when it's new
+#   --before-setup  setup-runner.sh's first step: logins from new addresses don't count
+audit() {
+  require_root
+  local mode="${1:-}" snapshot findings blocking
+  case "${mode}" in
+    "" | --accept | --notify | --before-setup) ;;
+    *) die "usage: ghrunner audit [--accept | --notify]" ;;
+  esac
+  install -d -m 0755 "${GHRUNNER_STATE_DIR}"
+  snapshot="$(mktemp)"
+  # shellcheck disable=SC2064 # expand now: the file name is local
+  trap "rm -f '${snapshot}'" EXIT
+  audit_snapshot >"${snapshot}"
+
+  if [[ ! -f ${AUDIT_BASELINE} || "$(head -n 1 "${AUDIT_BASELINE}")" != "${AUDIT_FORMAT}" ]]; then
+    case "${mode}" in
+      --accept) audit_accept "${snapshot}" && audit_record "" && note "baseline recorded" && return ;;
+      --before-setup) note "no baseline yet; setup records one at the end" && return ;;
+      *) die "there is no audit baseline yet: run 'sudo ghrunner audit --accept' (setup-runner.sh does this)" ;;
+    esac
+  fi
+  findings="$(audit_diff "${AUDIT_BASELINE}" "${snapshot}")"
+
+  case "${mode}" in
+    --accept)
+      if [[ -n ${findings} ]]; then
+        log "Accepting these changes"
+        audit_table "${findings}"
+      fi
+      audit_accept "${snapshot}"
+      audit_record ""
+      note "baseline updated"
+      ;;
+    --before-setup)
+      if [[ -n ${findings} ]]; then audit_table "${findings}"; fi
+      blocking="$(awk -F'\t' '$1 != "logins"' <<<"${findings}")"
+      [[ -z ${blocking} ]]
+      ;;
+    --notify)
+      audit_record "${findings}"
+      [[ -z ${findings} ]]
+      ;;
+    *)
+      audit_record "${findings}"
+      if [[ -z ${findings} ]]; then
+        note "nothing changed since the baseline ($(date -r "${AUDIT_BASELINE}" '+%Y-%m-%d %H:%M'))"
+        return
+      fi
+      audit_table "${findings}"
+      note "If you made these changes: sudo ghrunner audit --accept"
+      note "If you didn't: see 'If the VM is compromised' in github-runner/README.md"
+      exit 1
+      ;;
+  esac
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -876,16 +1138,22 @@ check_runner_services() {
   fi
 }
 
-# Clean-up job: without it the disk fills with old images and build cache.
-check_cleanup_job() {
-  if [[ ! -e ${PRUNE_SCRIPT} ]]; then
-    record FAIL "Clean-up job" "${PRUNE_SCRIPT} missing: run setup-runner.sh again"
-  elif [[ ! -x ${PRUNE_SCRIPT} ]]; then
-    record FAIL "Clean-up job" "${PRUNE_SCRIPT} isn't executable: sudo chmod +x ${PRUNE_SCRIPT}"
-  elif ! systemctl is-active --quiet cron 2>/dev/null; then
-    record FAIL "Clean-up job" "the cron service isn't running"
+# Scheduled jobs: the weekly Docker clean-up (cron), the weekly update and the daily audit (timers).
+check_scheduled_jobs() {
+  local problems="" timer
+  if [[ ! -x ${PRUNE_SCRIPT} ]]; then problems="${PRUNE_SCRIPT} missing or not executable"; fi
+  if ! systemctl is-active --quiet cron 2>/dev/null; then problems="${problems:+${problems}; }cron isn't running"; fi
+  for timer in ghrunner-update ghrunner-audit; do
+    if ! systemctl is-active --quiet "${timer}.timer" 2>/dev/null; then
+      problems="${problems:+${problems}; }${timer}.timer isn't on"
+    elif systemctl is-failed --quiet "${timer}.service" 2>/dev/null; then
+      problems="${problems:+${problems}; }${timer} failed last time (journalctl -u ${timer})"
+    fi
+  done
+  if [[ -n ${problems} ]]; then
+    record FAIL "Scheduled jobs" "${problems}: run setup-runner.sh again"
   else
-    record PASS "Clean-up job" "${PRUNE_SCRIPT}, weekly"
+    record PASS "Scheduled jobs" "clean-up, weekly update and daily audit on"
   fi
 }
 
@@ -957,7 +1225,7 @@ sshd_first_values() {
 sshd_auth_settings() {
   local settings
   if [[ ${EUID} -eq 0 ]] && settings="$(sshd -T 2>/dev/null)"; then
-    grep -E '^(passwordauthentication|kbdinteractiveauthentication) ' <<<"${settings}"
+    grep -E '^(passwordauthentication|kbdinteractiveauthentication|port) ' <<<"${settings}"
     return
   fi
   sshd_config_stream /etc/ssh/sshd_config /etc/ssh | sshd_first_values
@@ -975,7 +1243,7 @@ check_ssh() {
     return
   fi
   if grep -qx 'passwordauthentication no' <<<"${settings}" && grep -qx 'kbdinteractiveauthentication no' <<<"${settings}"; then
-    record PASS "SSH keys only" "password login off"
+    record PASS "SSH keys only" "password login off$(awk '$1 == "port" { ports = ports " " $2 } END { if (ports) print "; port" ports }' <<<"${settings}")"
   else
     record FAIL "SSH keys only" "password login is on: run setup-runner.sh again (needs an authorized key)"
   fi
@@ -1067,6 +1335,50 @@ check_tool_settings() {
   fi
 }
 
+# Kernel: a new kernel's fixes only apply after a reboot, which nothing here does by itself.
+check_kernel() {
+  local waiting
+  waiting="$(kernel_waiting)"
+  if [[ -n ${waiting} ]]; then
+    record WARN "Kernel" "${waiting} installed, $(uname -r) running: sudo reboot when convenient"
+  else
+    record PASS "Kernel" "running the newest installed ($(uname -r))"
+  fi
+}
+
+# Audit: the daily comparison with the baseline is how a tampered VM gets noticed.
+check_audit() {
+  local when count
+  if [[ ! -r ${AUDIT_STATUS} ]]; then
+    record WARN "Audit" "hasn't run yet: sudo ghrunner audit"
+    return
+  fi
+  IFS=$'\t' read -r when count <"${AUDIT_STATUS}"
+  if ((count > 0)); then
+    record FAIL "Audit" "${count} change(s) nobody accepted ($(when_was "${when}")): sudo ghrunner audit"
+  elif (($(date +%s) - when > 2 * 86400)); then
+    record WARN "Audit" "last ran $(when_was "${when}"): is ghrunner-audit.timer on?"
+  else
+    record PASS "Audit" "no unexpected changes ($(when_was "${when}"))"
+  fi
+}
+
+# Public repositories: a self-hosted runner lets anyone's pull request run as root here (root only:
+# the repository names are in the runners' folders).
+check_public_repositories() {
+  [[ ${EUID} -eq 0 ]] || return 0
+  local full public=""
+  while read -r full; do
+    [[ -n ${full} ]] || continue
+    if [[ "$(repository_visibility "${full}")" == "public" ]]; then public="${public:+${public}, }${full}"; fi
+  done < <(repositories_with_runners)
+  if [[ -n ${public} ]]; then
+    record FAIL "Private repositories" "public, remove their runners: ${public} (sudo ghrunner delete <repo>)"
+  else
+    record PASS "Private repositories" "every repository with runners here is private"
+  fi
+}
+
 # Reboot: security updates to the kernel and libraries only take effect after one.
 check_reboot() {
   if [[ -f /var/run/reboot-required ]]; then
@@ -1097,10 +1409,13 @@ doctor() {
   check_docker
   check_runner_services
   check_sizing
+  check_public_repositories
   check_tool_settings
-  check_cleanup_job
+  check_scheduled_jobs
   check_firewall
   check_ssh
+  check_audit
+  check_kernel
   check_reboot
   check_swap
   check_ghrunner_version
@@ -1118,18 +1433,19 @@ usage() {
   cat <<'EOF'
 Usage: ghrunner <command> [arguments]
 
-Commands               What it does                                                     Needs sudo
-  add <repo> [count]   register runners 1..count for a repository (count: auto)         yes
-  delete <repo>        stop, unregister and remove a repository's runners               yes
-  resize [repo]        after a VM resize: add, relabel or remove runners to fit         yes
-  update               update system packages, report reboot and runner versions        yes
-  status               each runner: service, idle or busy, current job                  no
-  stats [days]         jobs, results and durations (default 7 days), disk, memory       no
-  prune                run the weekly Docker clean-up now, show the space freed         yes
-  doctor               health checks as a PASS/WARN/FAIL table; exits 1 on a FAIL       no
-  version              installed version, and whether main has a newer one              no
-  self-update [--yes]  update ghrunner and setup from main, after showing what changed  yes
-  help                 this text                                                        no
+Commands                What it does                                                        Needs sudo
+  add <repo> [count]    register runners 1..count for a repository (count: auto)            yes
+  delete <repo>         stop, unregister and remove a repository's runners                  yes
+  resize [repo]         after a VM resize: add, relabel or remove runners to fit            yes
+  update [--scheduled]  upgrade all packages, warn about a waiting kernel, runner versions  yes
+  status                each runner: service, idle or busy, current job                     no
+  stats [days]          jobs, results and durations (default 7 days), disk, memory          no
+  prune                 run the weekly Docker clean-up now, show the space freed            yes
+  doctor                health checks as a PASS/WARN/FAIL table; exits 1 on a FAIL          no
+  audit [--accept]      list changes since the baseline (users, keys, sudo, ports...)       yes
+  version               installed version, and whether main has a newer one                 no
+  self-update [--yes]   update ghrunner and setup from main, after showing what changed     yes
+  help                  this text                                                           no
 
 <repo> is "repo" (owner: GITHUB_OWNER, default Sna-ke) or "owner/repo", e.g. example-org/example-app.
 add and delete get tokens from GITHUB_TOKEN (fine-grained, Administration: read and write; never
@@ -1151,6 +1467,7 @@ main() {
     stats) stats "$@" ;;
     prune) prune "$@" ;;
     doctor) doctor "$@" ;;
+    audit) audit "$@" ;;
     version | --version) version "$@" ;;
     self-update) self_update "$@" ;;
     help | -h | --help) usage ;;

@@ -314,13 +314,15 @@ download_runner() { echo "/tmp/archive.tar.gz"; }
 busy_units() { echo "unit-2"; }
 # shellcheck disable=SC2317,SC2329
 token_available() { [[ -z ${NO_TOKEN:-} ]]; }
+# shellcheck disable=SC2317,SC2329
+repository_visibility() { echo "${VISIBILITY:-private}"; }
 
 # Runs resize_repository for <repo> and prints the summary rows, then the to-do list.
 resize_sample() {
   : >"${ACTIONS}"
   resize_repository "$1" >/dev/null
   printf '%s\n' "${RESIZE_ROWS[@]}"
-  printf 'TODO %s\n' "${RESIZE_TODO[@]}"
+  printf 'TODO %s\n' "${STILL_TO_DO[@]}"
 }
 
 RESULT="$(RUNNER_COUNT=1 resize_sample Sna-ke/GroundCore)"
@@ -352,12 +354,15 @@ check "grow: installed runner 2" "install Sna-ke/GroundCore 2" "$(<"${ACTIONS}")
 # Runs resize_report with one unfinished step.
 report_with_todo() {
   RESIZE_ROWS=($'vps-a-1\tadd\tnot done')
-  RESIZE_TODO=("vps-a-1 (add): why and how")
+  STILL_TO_DO=("vps-a-1 (add): why and how")
   resize_report
 }
+RESULT="$(RUNNER_COUNT=2 VISIBILITY=public resize_sample Sna-ke/GroundCore)"
+check "public repository: nothing touched, says why" "1" "$(grep -c '^TODO Sna-ke/GroundCore .*public repository' <<<"${RESULT}")"
+check "public repository: no actions" "" "$(<"${ACTIONS}")"
 check "resize report fails when work is left" "fails" "$(outcome report_with_todo)"
 check "resize report lists why and how" "1. vps-a-1 (add): why and how" "$(report_with_todo | tail -n 1)"
-unset -f install_runner remove_runner reregister_runner download_runner busy_units token_available
+unset -f install_runner remove_runner reregister_runner download_runner busy_units token_available repository_visibility
 
 # ---------------------------------------------------------------------------------------------
 # version and self-update
@@ -416,6 +421,112 @@ check "describe version with commit" "1.3.0 (commit abcdef1)" "$(describe_versio
 check "describe version, commit unknown" "1.3.0" "$(describe_version 1.3.0 unknown)"
 check "installed version of an old copy" "1.2.0 or older" "$(GHRUNNER_LIB_DIR="${SAMPLES}/installed" installed_version)"
 check "self-update without root" "fails" "$(outcome bash "${TESTS_DIR}/../ghrunner.sh" self-update --bogus)"
+
+# ---------------------------------------------------------------------------------------------
+# Security: repository visibility, SSH settings, audit
+# ---------------------------------------------------------------------------------------------
+
+check "visibility: public" "public" "$(visibility_from_response 200 '{"private": false}')"
+check "visibility: private (with a token)" "private" "$(visibility_from_response 200 '{"private": true}')"
+check "visibility: hidden means private" "private" "$(visibility_from_response 404 '{"message": "Not Found"}')"
+check "visibility: rate limited" "unknown" "$(visibility_from_response 403 '{}')"
+
+# setup-runner.sh's functions (it only runs when executed, not when sourced).
+# shellcheck source=SCRIPTDIR/../setup-runner.sh
+. "${TESTS_DIR}/../setup-runner.sh"
+trap - ERR
+check "ssh port 22" "ok" "$(outcome valid_ssh_port 22)"
+check "ssh port 9452" "ok" "$(outcome valid_ssh_port 9452)"
+check "ssh port 80 refused" "fails" "$(outcome valid_ssh_port 80)"
+check "ssh port 70000 refused" "fails" "$(outcome valid_ssh_port 70000)"
+check "ssh port text refused" "fails" "$(outcome valid_ssh_port 22a)"
+# shellcheck disable=SC2317,SC2329
+has_terminal() { return 1; }
+check "no terminal keeps the port" "9452" "$(choose_ssh_port 9452)"
+check "no terminal never moves off 22" "22" "$(choose_ssh_port 22)"
+check "SSH_PORT wins" "2200" "$(SSH_PORT=2200 choose_ssh_port 22)"
+# Runs choose_ssh_port with SSH_PORT=80, which should stop with an error.
+choose_bad_port() {
+  SSH_PORT=80
+  choose_ssh_port 22
+}
+check "a bad SSH_PORT stops" "fails" "$(outcome choose_bad_port)"
+unset -f has_terminal
+SETTINGS="$(ssh_settings yes no 22 9452)"
+check "ssh settings: both ports while moving" $'Port 22\nPort 9452' "$(grep '^Port' <<<"${SETTINGS}")"
+check "ssh settings: keys only" $'PasswordAuthentication no\nKbdInteractiveAuthentication no' \
+  "$(grep -E '^(Password|KbdInteractive)' <<<"${SETTINGS}")"
+check "ssh settings: runner can't log in" "DenyUsers runner" "$(grep '^DenyUsers' <<<"${SETTINGS}")"
+check "ssh settings: no key, password stays" "" "$(ssh_settings no prohibit-password 22 | grep '^PasswordAuthentication' || true)"
+
+check "audit users" "users	root	uid=0 shell=/bin/bash
+users	ubuntu	uid=1000 shell=/bin/bash
+users	runner	uid=1001 shell=/bin/bash
+users	sneaky	uid=999 shell=/bin/sh" "$(audit_users <<'EOF'
+root:x:0:0:root:/root:/bin/bash
+daemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin
+sync:x:4:65534:sync:/bin:/bin/sync
+ubuntu:x:1000:1000:Ubuntu:/home/ubuntu:/bin/bash
+runner:x:1001:1001::/home/runner:/bin/bash
+sneaky:x:999:999::/var/lib/x:/bin/sh
+nobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin
+EOF
+)"
+check "public listeners" "tcp 9452
+udp 68" "$(public_listeners <<'EOF'
+tcp   LISTEN 0      4096       0.0.0.0:9452       0.0.0.0:*
+tcp   LISTEN 0      4096          [::]:9452          [::]:*
+tcp   LISTEN 0      4096     127.0.0.53%lo:53     0.0.0.0:*
+tcp   LISTEN 0      4096     127.0.0.1:5432     0.0.0.0:*
+tcp   LISTEN 0      4096         [::1]:631          [::]:*
+udp   UNCONN 0      0     10.0.0.5%ens3:68       0.0.0.0:*
+udp   UNCONN 0      0        127.0.0.1:323       0.0.0.0:*
+EOF
+)"
+check "ssh logins" "brian from 203.0.113.7
+root from 198.51.100.9" "$(parse_logins <<'EOF'
+Accepted publickey for brian from 203.0.113.7 port 51234 ssh2: ED25519 SHA256:abc
+Accepted publickey for brian from 203.0.113.7 port 51240 ssh2: ED25519 SHA256:abc
+Failed password for invalid user admin from 192.0.2.1 port 4444 ssh2
+Accepted keyboard-interactive/pam for root from 198.51.100.9 port 1 ssh2
+EOF
+)" || true
+check "newest kernel" "6.8.0-51-generic" "$(printf 'vmlinuz-6.8.0-9-generic\nvmlinuz-6.8.0-51-generic\nvmlinuz-6.8.0-49-generic\n' | newest_kernel)"
+
+GHRUNNER_STATE_DIR="${SAMPLES}/state"
+AUDIT_BASELINE="${GHRUNNER_STATE_DIR}/audit-baseline"
+AUDIT_STATUS="${GHRUNNER_STATE_DIR}/audit-status"
+printf 'firewall\tStatus: active\t-\nlogins\tbrian from 203.0.113.7\t-\nsudo\t/etc/sudoers\taaaa\nusers\trunner\tuid=1001 shell=/bin/bash\n' \
+  >"${SAMPLES}/snapshot-1"
+audit_accept "${SAMPLES}/snapshot-1"
+check "baseline has its format line" "${AUDIT_FORMAT}" "$(head -n 1 "${AUDIT_BASELINE}")"
+check "baseline is root-only" "600" "$(stat -c %a "${AUDIT_BASELINE}")"
+check "no changes" "" "$(audit_diff "${AUDIT_BASELINE}" "${SAMPLES}/snapshot-1")"
+printf 'firewall\tStatus: inactive\t-\nlistening\ttcp 4444\t-\nsudo\t/etc/sudoers\tbbbb\nusers\trunner\tuid=1001 shell=/bin/bash\n' \
+  >"${SAMPLES}/snapshot-2"
+check "changes: added, changed, removed; logins that aged out don't count" "firewall	added	Status: inactive
+firewall	removed	Status: active
+listening	added	tcp 4444
+sudo	changed	/etc/sudoers" "$(audit_diff "${AUDIT_BASELINE}" "${SAMPLES}/snapshot-2")"
+printf 'logins\tmallory from 192.0.2.66\t-\n' >>"${SAMPLES}/snapshot-1"
+check "a login from a new address counts" "logins	added	mallory from 192.0.2.66" \
+  "$(audit_diff "${AUDIT_BASELINE}" "${SAMPLES}/snapshot-1")"
+audit_accept "${SAMPLES}/snapshot-2"
+check "accepting keeps known logins" "1" "$(grep -c '^logins	brian from 203.0.113.7' "${AUDIT_BASELINE}")"
+
+ALERTS="${SAMPLES}/alerts"
+# shellcheck disable=SC2317,SC2329
+send_alert() { echo "$1" >>"${ALERTS}"; }
+audit_record "$(printf 'sudo\tchanged\t/etc/sudoers')"
+check "findings: status for doctor" "1" "$(cut -f2 "${AUDIT_STATUS}")"
+check "findings: note for the next login" "1" "$(grep -c 'nobody accepted' "${GHRUNNER_STATE_DIR}/attention/audit")"
+check "findings: one alert" "audit found 1 unexpected change(s)" "$(cat "${ALERTS}")"
+audit_record "$(printf 'sudo\tchanged\t/etc/sudoers')"
+check "same findings tomorrow: no second alert" "1" "$(wc -l <"${ALERTS}" | tr -d ' ')"
+audit_record ""
+check "all clear: login note removed" "fails" "$(outcome test -e "${GHRUNNER_STATE_DIR}/attention/audit")"
+check "all clear: status 0" "0" "$(cut -f2 "${AUDIT_STATUS}")"
+unset -f send_alert
 
 # ---------------------------------------------------------------------------------------------
 # status and stats end to end, with systemd, the journal and processes replaced by samples

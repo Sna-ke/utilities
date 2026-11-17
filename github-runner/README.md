@@ -7,6 +7,7 @@ running the host day to day.
 
 | File | What it is |
 | --- | --- |
+| `install.sh` | The one-line installer: downloads and checks the other three, asks for a token, runs setup, cleans up |
 | `setup-runner.sh` | Sets up the VM (run once, or again to repair or update) |
 | `ghrunner.sh` | The management command, installed as `/usr/local/bin/ghrunner` |
 | `runner-lib.sh` | Code both scripts share: download, SHA-256 check, register, unregister |
@@ -18,9 +19,12 @@ running the host day to day.
 
 | Step | Result |
 | --- | --- |
-| System | Updated, automatic security updates on |
-| SSH | Keys only (skipped if the VM has no authorized key, so it can't lock you out) |
-| Firewall | ufw: SSH in, nothing else. Runners only call out to GitHub |
+| System | Updated. Security updates daily; a full update weekly (see Security) |
+| SSH | Keys only, on the port you choose (9452 suggested). Details under Security |
+| Firewall | ufw: SSH in (rate-limited), nothing else. Runners only call out to GitHub |
+| Kernel network settings | Ignores ICMP redirects and source routing, sends no redirects, hides kernel addresses |
+| Audit | A baseline of the machine, checked daily (see Security) |
+| Alerts | Optional: a URL alerts are posted to, e.g. an ntfy.sh topic for your phone |
 | Docker | Docker Engine and Compose from Docker's apt repository. Published ports bind to 127.0.0.1, because Docker's port rules bypass ufw. Container logs capped |
 | Swap | 4 GB on machines under 10 GB of RAM |
 | Clean-up | Weekly `docker system prune` (`/etc/cron.weekly/docker-prune`), logged to the journal |
@@ -67,34 +71,36 @@ Whatever it can't do, it lists under "Still to do" with the reason and how to fi
 ## Run it
 
 1. Create the VM (Ubuntu 24.04, with your SSH key). Use it for nothing else: runners run whatever code is pushed to a
-   branch, with Docker, which is root-equivalent.
-2. Get registration tokens in one of two ways:
-   1. **A token for the script (recommended).** On GitHub: Settings > Developer settings > Fine-grained tokens. Choose
-      only the repositories the runners serve, the permission Administration: Read and write, and a 7-day expiry.
-      Delete the token when you're done.
-   2. **Paste as you go.** Leave `GITHUB_TOKEN` unset. For each runner, the script asks for a registration token from
-      the repository's Settings > Actions > Runners > New self-hosted runner page. Each token lasts an hour.
-3. On the VM:
+   branch, with Docker and sudo, which are root.
+2. Have a GitHub token ready, or plan to paste tokens as you go:
+   1. **A token (recommended).** On GitHub: Settings > Developer settings > Fine-grained tokens. Choose only the
+      repositories the runners serve, the permission Administration: Read and write, and a 7-day expiry. Delete the
+      token when you're done.
+   2. **Paste as you go.** Press Enter when asked for a token. For each runner, setup asks for a registration token
+      from the repository's Settings > Actions > Runners > New self-hosted runner page. Each lasts an hour.
+3. Log in to the VM as your admin user and run:
 
    ```sh
-   mkdir runner-setup && cd runner-setup
-   for file in setup-runner.sh runner-lib.sh ghrunner.sh; do
-     curl -fsSLO "https://raw.githubusercontent.com/Sna-ke/utilities/main/github-runner/${file}"
-   done
-   less setup-runner.sh runner-lib.sh ghrunner.sh   # read what you are about to run as root
-   read -rsp "Token: " GITHUB_TOKEN && export GITHUB_TOKEN   # not echoed; skip to paste per runner
-   sudo --preserve-env=GITHUB_TOKEN bash setup-runner.sh
+   curl -fsSL https://raw.githubusercontent.com/Sna-ke/utilities/main/github-runner/install.sh | sudo bash
    ```
 
-   The three files must sit in the same folder. Once setup is done, the folder can be deleted.
+   It asks for:
 
-   Serve more repositories with, for example, `RUNNER_REPOS=GroundCore,mealplan`.
-4. If the script says a reboot is needed, run `sudo reboot`. The runners come back by themselves.
+   | Question | Answer |
+   | --- | --- |
+   | GitHub token | The token from step 2 (hidden, kept in memory only), or Enter |
+   | SSH port | Enter for the suggested one (9452 on a new VM; afterwards, the current one) |
+   | Did the new port work? | Open a second terminal, log in with the `ssh -p` command it shows, then answer. Port 22 closes only after a yes |
+   | Alert URL | e.g. `https://ntfy.sh/<long-random-topic>` (subscribe to it in the ntfy app), or Enter for none |
+
+   To serve more repositories: `curl ... | sudo RUNNER_REPOS=GroundCore,mealplan bash`. To read the scripts before
+   running them, download `install.sh` and open it: it lists what it fetches.
+4. If setup says a reboot is needed, run `sudo reboot`. The runners come back by themselves.
 5. In each repository, set the Actions variables its CI reads. For GroundCore, see its `deploy/ci-runner.md`.
 6. Check the host with `ghrunner doctor`.
 
-A host set up before `ghrunner` existed gets it, and the clean-up job's journal logging, by running the new
-`setup-runner.sh` once more.
+To try a pull request's version on a VM before merging it, install from its branch:
+`curl -fsSL https://raw.githubusercontent.com/Sna-ke/utilities/<branch>/github-runner/install.sh | sudo GHRUNNER_BRANCH=<branch> bash`.
 
 ## Managing the host: `ghrunner`
 
@@ -103,11 +109,12 @@ A host set up before `ghrunner` existed gets it, and the clean-up job's journal 
 | `ghrunner add <repo> [count]` | Registers runners 1 to `count` for a repository, with the usual folders, names and labels. `count` defaults to the Sizing rule above. Runners that exist are kept | Yes |
 | `ghrunner delete <repo>` | Stops, uninstalls and unregisters that repository's runners, then deletes their folders | Yes |
 | `ghrunner resize [repo]` | After a VM resize: adds, relabels and removes runners to match the Sizing rule. Lists anything it couldn't do, with why and how, and exits 1 (see Resizing the VM) | Yes |
-| `ghrunner update` | Upgrades system packages and says whether a reboot is needed; compares each runner's version with the latest release (runners update themselves, so this only reports) | Yes |
+| `ghrunner update [--scheduled]` | Upgrades every package (Docker's too), never reboots, and warns when a new kernel waits for one; compares each runner's version with the latest release (runners update themselves, so this only reports). `--scheduled` is the weekly timer: it waits until no job is running and pauses the runners during the upgrade | Yes |
 | `ghrunner status` | Each runner: service state, idle or busy, and the job it is running | No |
 | `ghrunner stats [days]` | From the journal, for the last 7 days or `days`: jobs started and completed, results and average time, per runner and per repository. Then disk use of `/` and Docker, memory, swap, the last clean-up and the last reboot | No |
 | `ghrunner prune` | Runs the weekly clean-up now and shows the space freed | Yes |
-| `ghrunner doctor` | Checks disk (warn under 20% free, fail under 10%), Docker, every runner service, sizing, tool locations, the clean-up job, the firewall, SSH keys only, a pending reboot and swap. Prints PASS/WARN/FAIL and exits 1 on any FAIL | No |
+| `ghrunner doctor` | Checks disk (warn under 20% free, fail under 10%), Docker, every runner service, sizing, private repositories, tool locations, the scheduled jobs, the firewall, SSH, the audit, the kernel, a pending reboot, swap and the ghrunner version. Prints PASS/WARN/FAIL and exits 1 on any FAIL | No |
+| `ghrunner audit [--accept]` | Lists what changed since the audit baseline (see Security). `--accept` makes the current state the baseline, after you've checked the changes are yours | Yes |
 | `ghrunner version` | The installed version and commit, the latest on `main`, and whether they match | No |
 | `ghrunner self-update [--yes]` | Updates to the latest `main`, after listing what changed (see Updating) | Yes |
 | `ghrunner help` | Lists the commands | No |
@@ -145,8 +152,8 @@ sudo --preserve-env=GITHUB_TOKEN ghrunner self-update
 
 **Changing the scripts:** raise `GHRUNNER_VERSION` in `runner-lib.sh` (1.3.0 to 1.3.1 for a fix, 1.4.0 for a new
 feature) and add a line to `CHANGELOG.md`. CI fails a pull request that changes `setup-runner.sh`, `runner-lib.sh`
-or `ghrunner.sh` without both. A host installed before `self-update` existed needs one
-update by hand: download the three files as in step 3 of "Run it" and run `setup-runner.sh` again.
+or `ghrunner.sh` without both. A host installed before `self-update` existed updates with
+the one-line install (Run it, step 3).
 
 ## Other commands
 
@@ -162,6 +169,42 @@ update by hand: download the three files as in step 3 of "Run it" and run `setup
 3. Delete the old VM.
 
 Runner names include the VM's hostname, so old and new never clash.
+
+## Security
+
+| Protection | How |
+| --- | --- |
+| SSH | Keys only. Port of your choice. Root can't log in when another admin user has a key. The `runner` user can't log in. 3 tries per connection, 30 seconds to log in. No X11 or agent forwarding |
+| Moving the SSH port safely | Setup listens on both ports, asks you to log in on the new one from a second terminal, and closes the old one only after you say it worked. Without a terminal, it never changes the port |
+| Firewall | ufw allows only the SSH port, and blocks an address after 6 connection attempts in 30 seconds. Docker publishes ports on 127.0.0.1 only, because its rules bypass ufw |
+| Updates | Ubuntu's security updates daily. A full update (Docker included) weekly, Sunday 11:00 UTC (`UPDATE_SCHEDULE`): it waits until no job runs, pauses the runners, upgrades, and starts them again. It never reboots: a waiting kernel shows at login, in `doctor`, and as an alert |
+| Public repositories | Refused. On a public repository anyone can open a pull request, and its workflow would run as root here |
+| Audit | Setup records a baseline: accounts, SSH keys, sudo rules, SSH settings, firewall rules, ports open to the outside, cron jobs, services that start at boot, setuid programs, ghrunner's own files, and where SSH logins come from. A timer compares the machine with it daily |
+| Hearing about it | Audit findings and a waiting kernel show at every SSH login and in `ghrunner doctor`, and go to the alert URL if you set one (once per new set of findings, not daily) |
+| Updates can't bless a compromise | Setup, and so `self-update`, checks the audit first and stops if anything changed that nobody accepted |
+
+**Limits.** CI jobs run as root (Docker and sudo), which is why only private repositories you alone push to belong
+here. Someone with root on the VM can also hide from the audit; it catches mistakes and careless intruders, not a
+careful one. That is why a compromised VM is rebuilt rather than cleaned.
+
+**After a change you made** (a new SSH key, a package that adds a service), the next audit lists it: check it's
+yours, then run `sudo ghrunner audit --accept`. A login from a new address (your home IP changed, a phone hotspot)
+shows up the same way.
+
+## If the VM is compromised
+
+Signs: an audit finding you didn't make (a new key, user, sudo rule, open port, cron job or service), ghrunner's files
+changed, or anything else you can't explain. Don't try to clean it:
+
+1. Stop using it. Don't type passwords or tokens into it.
+2. In the OVH control panel, reinstall the VPS with Ubuntu 24.04 and your SSH key. This wipes the disk.
+3. Assume anything jobs could read was taken, and replace it:
+   1. Each repository's Actions secrets (Settings > Secrets and variables > Actions), and whatever they unlock.
+   2. The GitHub token, if you used one on that VM.
+4. Check each repository for things you didn't do: commits, workflow files, releases, deploy keys and webhooks.
+5. Run the one-line install (Run it, step 3). The runners register under their old names, which replaces the old
+   registrations; remove any that stay offline in Settings > Actions > Runners.
+6. Run `ghrunner doctor`.
 
 ## Where jobs install tools
 
@@ -197,7 +240,10 @@ Only a real runner host can test the rest:
 2. systemd: unit names as the runner's `svc.sh` writes them, service states, `Runner.Worker` cgroups (`status`).
 3. journald: the runner's real output lines and the clean-up job's log line (`status`, `stats`, `update`).
 4. Docker, apt, ufw, sshd and cron as they behave on Ubuntu 24.04 (`prune`, `update`, `doctor`).
-5. A full `self-update` (it runs `setup-runner.sh`). Its version check, hashes and download were tested against
+5. Moving the SSH port (ssh.socket taking the port from sshd's settings), the timers, the login message, alerts,
+   and a full audit snapshot (`ss`, `ssh-keygen`, `find`, `sshd -T`).
+6. The one-line installer end to end. Its download and hash checks were tested against this repository on GitHub.
+7. A full `self-update` (it runs `setup-runner.sh`). Its version check, hashes and download were tested against
    this repository on GitHub.
 
 A first run on a new host: `ghrunner doctor`, `ghrunner status` while a job runs, `sudo ghrunner prune`, then
