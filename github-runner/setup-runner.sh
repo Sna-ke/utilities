@@ -10,19 +10,22 @@
 #      Docker clean-up.
 #   5. Downloads the latest runner release, checks its SHA-256, and registers runners
 #      for each repository as systemd services.
-#   6. Installs the "ghrunner" management command (/usr/local/bin/ghrunner).
+#   6. Gives every runner, new or existing, the .env settings that tell jobs where to install tools
+#      (.NET, and the tool cache Python and Ruby need), restarting idle runners whose settings changed.
+#   7. Installs the "ghrunner" management command (/usr/local/bin/ghrunner).
 #
 # Needs runner-lib.sh and ghrunner.sh in the same folder as this script.
 #
 # Usage (as root, on the VM):
-#   setup-runner.sh            set up, or add missing runners
+#   setup-runner.sh            set up, or bring runners in line with this machine's size
 #   setup-runner.sh status     list the runners (same as "ghrunner status")
 #   setup-runner.sh remove     unregister every runner on this VM (before deleting it)
 #
 # Settings come from environment variables (defaults in brackets):
 #   GITHUB_OWNER        [Sna-ke]      account that owns the repositories
 #   RUNNER_REPOS        [GroundCore]  comma-separated repositories to serve
-#   RUNNER_COUNT        [auto]        runners per repository; auto = 2 with 10 GB RAM or more, else 1
+#   RUNNER_COUNT        [auto]        runners per repository; auto = one per 5 GB of RAM and 3 cores,
+#                                     at least 1 (OVH VPS-1 and VPS-2: 1; VPS-3 and VPS-4: 2)
 #   STACK_LABEL         [auto]        give each repository's first runner the "<repo>-stack" label;
 #                                     auto = yes with 6 GB RAM or more
 #   SWAP_SIZE_GB        [auto]        swap file size; auto = 4 below 10 GB RAM, else none
@@ -75,7 +78,7 @@ resolve_auto_settings() {
   if [[ ${SWAP_SIZE_GB} == "auto" ]]; then
     if ((memory < 10)); then SWAP_SIZE_GB=4; else SWAP_SIZE_GB=0; fi
   fi
-  note "memory ${memory} GB: ${RUNNER_COUNT} runner(s) per repository, stack label ${STACK_LABEL}, swap ${SWAP_SIZE_GB} GB"
+  note "memory ${memory} GB, $(cpu_count) cores: ${RUNNER_COUNT} runner(s) per repository, stack label ${STACK_LABEL}, swap ${SWAP_SIZE_GB} GB"
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -260,19 +263,23 @@ setup() {
   create_runner_user
   install_ghrunner
 
-  log "Downloading the runner"
-  local archive repository full index
-  local -a repositories
-  archive="$(download_runner)"
-  note "verified $(basename "${archive}")"
-
+  # RUNNER_REPOS plus any repository given runners later with ghrunner, so a re-run after a VM resize
+  # adjusts them all (same code as "ghrunner resize").
+  local repository full
+  local -a repositories requested=()
   IFS=',' read -r -a repositories <<<"${RUNNER_REPOS}"
   for repository in "${repositories[@]}"; do
     full="$(full_repository_name "${repository}")" || exit 1
-    for ((index = 1; index <= RUNNER_COUNT; index++)); do
-      install_runner "${full}" "${index}" "${archive}"
-    done
+    requested+=("${full}")
   done
+  mapfile -t repositories < <({ printf '%s\n' "${requested[@]}"; repositories_with_runners; } | sort -fu)
+  for full in "${repositories[@]}"; do
+    resize_repository "${full}"
+  done
+
+  log "Runner settings (.env)"
+  configure_runners
+  note "all runners up to date"
 
   log "Done"
   if [[ -f /var/run/reboot-required ]]; then
@@ -281,6 +288,10 @@ setup() {
   note "Next, in each repository: Settings > Secrets and variables > Actions > Variables."
   note "GroundCore: CI_RUNNER=groundcore-ci; CI_STACK_RUNNER=groundcore-stack only if a runner has that label."
   note "Check the host any time with: ghrunner doctor"
+  if ((${#RESIZE_TODO[@]} > 0)); then
+    log "Still to do"
+    printf '    - %s\n' "${RESIZE_TODO[@]}"
+  fi
 }
 
 status() {
