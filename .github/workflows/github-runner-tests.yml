@@ -15,5 +15,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # the version check compares with the branch the pull request goes into
       - name: ghrunner parsing tests (jq is preinstalled on GitHub's Ubuntu runners)
         run: bash github-runner/tests/ghrunner-test.sh
+      - name: Version raised when the scripts change
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: bash github-runner/tests/version-check.sh "origin/${BASE_REF}"

@@ -10,7 +10,9 @@ running the host day to day.
 | `setup-runner.sh` | Sets up the VM (run once, or again to repair or update) |
 | `ghrunner.sh` | The management command, installed as `/usr/local/bin/ghrunner` |
 | `runner-lib.sh` | Code both scripts share: download, SHA-256 check, register, unregister |
+| `CHANGELOG.md` | What changed in each version |
 | `tests/ghrunner-test.sh` | Tests `ghrunner`'s parsing against sample input |
+| `tests/version-check.sh` | CI check: a change to the scripts raises the version and adds a changelog line |
 
 ## What it sets up
 
@@ -106,7 +108,7 @@ A host set up before `ghrunner` existed gets it, and the clean-up job's journal 
 | `ghrunner stats [days]` | From the journal, for the last 7 days or `days`: jobs started and completed, results and average time, per runner and per repository. Then disk use of `/` and Docker, memory, swap, the last clean-up and the last reboot | No |
 | `ghrunner prune` | Runs the weekly clean-up now and shows the space freed | Yes |
 | `ghrunner doctor` | Checks disk (warn under 20% free, fail under 10%), Docker, every runner service, sizing, tool locations, the clean-up job, the firewall, SSH keys only, a pending reboot and swap. Prints PASS/WARN/FAIL and exits 1 on any FAIL | No |
-| `ghrunner version` | The installed commit, the latest on `main`, and whether they match | No |
+| `ghrunner version` | The installed version and commit, the latest on `main`, and whether they match | No |
 | `ghrunner self-update [--yes]` | Updates to the latest `main`, after listing what changed (see Updating) | Yes |
 | `ghrunner help` | Lists the commands | No |
 
@@ -132,14 +134,18 @@ sudo --preserve-env=GITHUB_TOKEN ghrunner self-update
 
 1. Finds the latest commit on `main` that changed `github-runner/`, and stops if the installed files already
    match it.
-2. Lists the changes since the installed commit and asks before going on. Use `--yes` to skip the question
+2. Lists the [changelog](CHANGELOG.md) lines newer than the installed version, and asks before going on. Use `--yes` to skip the question
    (for example, from cron).
 3. Downloads all three files from that exact commit, so they always match each other, and checks each against
    the hash GitHub reports for it.
 4. Runs that version's `setup-runner.sh`, the same as updating by hand: packages, `ghrunner`, runner settings and
    sizing. Its summary lists anything left to do.
 
-`ghrunner doctor` warns when `main` has a newer version. A host installed before `self-update` existed needs one
+`ghrunner doctor` warns when `main` has a newer version.
+
+**Changing the scripts:** raise `GHRUNNER_VERSION` in `runner-lib.sh` (1.3.0 to 1.3.1 for a fix, 1.4.0 for a new
+feature) and add a line to `CHANGELOG.md`. CI fails a pull request that changes `setup-runner.sh`, `runner-lib.sh`
+or `ghrunner.sh` without both. A host installed before `self-update` existed needs one
 update by hand: download the three files as in step 3 of "Run it" and run `setup-runner.sh` again.
 
 ## Other commands

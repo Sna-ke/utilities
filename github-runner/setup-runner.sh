@@ -230,7 +230,7 @@ install_ghrunner() {
   if [[ -n ${GHRUNNER_COMMIT:-} || ${SCRIPT_DIR} != "${GHRUNNER_LIB_DIR}" || ! -f ${GHRUNNER_LIB_DIR}/VERSION ]]; then
     echo "${GHRUNNER_COMMIT:-unknown}" >"${GHRUNNER_LIB_DIR}/VERSION"
   fi
-  note "version $(<"${GHRUNNER_LIB_DIR}/VERSION"); run 'ghrunner help' for its commands"
+  note "ghrunner ${GHRUNNER_VERSION} (commit $(cut -c1-7 "${GHRUNNER_LIB_DIR}/VERSION")); run 'ghrunner help' for its commands"
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -257,6 +257,7 @@ create_runner_user() {
 # ---------------------------------------------------------------------------------------------
 
 setup() {
+  log "setup-runner.sh ${GHRUNNER_VERSION}"
   require_root_on_ubuntu
   [[ -f ${SCRIPT_DIR}/ghrunner.sh ]] || die "ghrunner.sh is missing from ${SCRIPT_DIR}; download it next to this script"
   resolve_auto_settings
