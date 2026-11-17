@@ -178,7 +178,7 @@ sample_sshd() {
     printf '%b' "$2" >"${folder}/sshd_config.d/$1"
     shift 2
   done
-  sshd_config_stream "${folder}/sshd_config" "${folder}" | sshd_first_values
+  sshd_config_stream "${folder}/sshd_config" "${folder}" | sshd_first_values | head -n 2
 }
 NO_NO=$'passwordauthentication no\nkbdinteractiveauthentication no'
 check "sshd: ours sorts before cloud-init's" "${NO_NO}" "$(sample_sshd a \
@@ -191,6 +191,46 @@ check "sshd: Match blocks don't count, and end with their file" $'passwordauthen
   "$(sample_sshd d 05-match.conf 'Match User example\n  PasswordAuthentication no\n' 60-later.conf 'PasswordAuthentication yes\n')"
 check "sshd: key=value and the old ChallengeResponse name" "${NO_NO}" \
   "$(sample_sshd e 10-x.conf '  passwordauthentication=no\nChallengeResponseAuthentication no\n')"
+mkdir -p "${SAMPLES}/g/sshd_config.d"
+printf 'Include %s/sshd_config.d/*.conf\nKbdInteractiveAuthentication no\n' "${SAMPLES}/g" >"${SAMPLES}/g/sshd_config"
+printf 'Port 22\nPort 9452\nPasswordAuthentication no\nPermitRootLogin no\nMaxAuthTries 3\nDenyUsers runner\n' \
+  >"${SAMPLES}/g/sshd_config.d/10-runner-host.conf"
+printf 'PasswordAuthentication yes\nPermitRootLogin yes\n' >"${SAMPLES}/g/sshd_config.d/50-cloud-init.conf"
+SSH_SAMPLE="$(sshd_config_stream "${SAMPLES}/g/sshd_config" "${SAMPLES}/g" | sshd_first_values)"
+check "sshd: every setting the check needs, first value wins, every Port counts" "passwordauthentication no
+kbdinteractiveauthentication no
+permitrootlogin no
+maxauthtries 3
+denyusers runner
+port 22
+port 9452" "${SSH_SAMPLE}"
+check "ssh problems: moving ports" "WARN listening on ports 22 9452: confirm the new one so the old one closes" \
+  "$(ssh_problems <<<"${SSH_SAMPLE}")"
+check "ssh problems: none when locked down" "" "$(grep -v '^port 22$' <<<"${SSH_SAMPLE}" | ssh_problems)"
+check "ssh problems: a stock server" "FAIL password login is on
+WARN on port 22, which every scanner tries
+WARN root can log in (prohibit-password)
+WARN the runner user can log in over SSH
+WARN 6 tries per connection" "$(printf 'passwordauthentication yes\nkbdinteractiveauthentication no\npermitrootlogin prohibit-password\nmaxauthtries 6\nport 22\n' | ssh_problems)"
+
+UFW_SAMPLE="Status: active
+
+To                         Action      From
+--                         ------      ----
+9452/tcp                   LIMIT       Anywhere                   # SSH
+22/tcp                     LIMIT       Anywhere                   # SSH
+OpenSSH                    ALLOW       Anywhere
+80/tcp                     ALLOW       Anywhere
+9452/tcp (v6)              LIMIT       Anywhere (v6)              # SSH
+80/tcp (v6)                ALLOW       Anywhere (v6)
+5000/tcp                   DENY        Anywhere"
+check "firewall: SSH moved, leftovers" "also lets in 22/tcp
+also lets in OpenSSH
+also lets in 80/tcp" "$(firewall_problems 9452 <<<"${UFW_SAMPLE}")"
+check "firewall: still on 22, plain allow" "OpenSSH has no rate limit
+also lets in 80/tcp" "$(firewall_problems 22 9452 <<<"${UFW_SAMPLE}")"
+check "firewall: clean" "" "$(firewall_problems 9452 <<<"$(grep -vE '^(22/tcp|OpenSSH|80/tcp)' <<<"${UFW_SAMPLE}")")"
+
 if ((EUID != 0)); then
   mkdir -p "${SAMPLES}/f/sshd_config.d"
   printf 'Include %s/sshd_config.d/*.conf\n' "${SAMPLES}/f" >"${SAMPLES}/f/sshd_config"
@@ -529,6 +569,41 @@ audit_record ""
 check "all clear: login note removed" "fails" "$(outcome test -e "${GHRUNNER_STATE_DIR}/attention/audit")"
 check "all clear: status 0" "0" "$(cut -f2 "${AUDIT_STATUS}")"
 unset -f send_alert
+
+# ---------------------------------------------------------------------------------------------
+# doctor: kernel settings, Pushover, fixable problems
+# ---------------------------------------------------------------------------------------------
+
+# shellcheck disable=SC2317,SC2329
+current_kernel_value() { if [[ $1 == "kernel.dmesg_restrict" ]]; then echo 0; else grep -m1 "^$1=" <<<"$(printf '%s\n' "${KERNEL_SETTINGS[@]}")" | cut -d= -f2; fi; }
+DOCTOR_ROWS=()
+DOCTOR_FIXABLE=0
+check_kernel_settings
+check "kernel settings: one off" "Kernel settings	WARN	not hardened: kernel.dmesg_restrict=0" "${DOCTOR_ROWS[0]}"
+# shellcheck disable=SC2317,SC2329
+current_kernel_value() { if [[ $1 == net.ipv6.* ]]; then return 1; fi; grep -m1 "^$1=" <<<"$(printf '%s\n' "${KERNEL_SETTINGS[@]}")" | cut -d= -f2; }
+DOCTOR_ROWS=()
+check_kernel_settings
+check "kernel settings: IPv6 turned off isn't a problem" "Kernel settings	PASS	no redirects or source routing; kernel addresses hidden" "${DOCTOR_ROWS[0]}"
+check "a fixable warning marks doctor --fix" "1" "${DOCTOR_FIXABLE}"
+unset -f current_kernel_value
+DOCTOR_ROWS=()
+DOCTOR_FIXABLE=0
+record WARN "Kernel" "reboot when convenient"
+check "a warning setup can't fix doesn't" "0" "${DOCTOR_FIXABLE}"
+record PASS "SSH" "fine" fix
+check "a pass never does" "0" "${DOCTOR_FIXABLE}"
+
+check "pushover key" "ok" "$(outcome valid_pushover_key "$(printf 'a%.0s' {1..30})")"
+check "pushover key: too short" "fails" "$(outcome valid_pushover_key abc)"
+check "pushover key: not letters and digits" "fails" "$(outcome valid_pushover_key "$(printf 'a%.0s' {1..29})-")"
+PUSHOVER_FILE="${SAMPLES}/pushover"
+check "pushover: off without a file" "" "$(pushover_settings)"
+printf 'PUSHOVER_USER=%s\nPUSHOVER_TOKEN=%s\n' "$(printf 'u%.0s' {1..30})" "$(printf 't%.0s' {1..30})" >"${PUSHOVER_FILE}"
+check "pushover: settings" "$(printf 'u%.0s' {1..30})	$(printf 't%.0s' {1..30})" "$(pushover_settings)"
+check "curl config quoting" 'form-string = "message=say \"hi\"\nC:\\temp"' "$(pushover_field message $'say "hi"\nC:\\temp')"
+check "pushover reply ok" "ok" "$(outcome pushover_ok <<<'{"status":1,"request":"x"}')"
+check "pushover reply refused" "fails" "$(outcome pushover_ok <<<'{"status":0,"errors":["application token is invalid"]}')"
 
 # ---------------------------------------------------------------------------------------------
 # status and stats end to end, with systemd, the journal and processes replaced by samples

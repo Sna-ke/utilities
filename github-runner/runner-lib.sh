@@ -15,7 +15,7 @@
 # The version of these scripts. Every pull request that changes setup-runner.sh, runner-lib.sh or
 # ghrunner.sh raises it and adds a line to CHANGELOG.md; CI checks both (tests/version-check.sh).
 # shellcheck disable=SC2034 # read by the scripts that source this file
-GHRUNNER_VERSION="1.4.0"
+GHRUNNER_VERSION="1.5.0"
 
 GITHUB_OWNER="${GITHUB_OWNER:-Sna-ke}"
 # shellcheck disable=SC2034 # read by the scripts that source this file
@@ -36,7 +36,26 @@ GHRUNNER_REPO="${GHRUNNER_REPO:-Sna-ke/utilities}"
 GHRUNNER_FILES=(setup-runner.sh runner-lib.sh ghrunner.sh)
 # State that ghrunner keeps: the audit baseline, notes shown at login, and the alert URL (root only).
 GHRUNNER_STATE_DIR="/var/lib/ghrunner"
-ALERT_URL_FILE="/etc/ghrunner/alert-url"
+# Pushover user key and application token for alerts (PUSHOVER_USER=..., PUSHOVER_TOKEN=...), root only.
+PUSHOVER_FILE="/etc/ghrunner/pushover"
+# 1.4.0 posted alerts to a URL kept here; Pushover replaced it and setup removes the file.
+# shellcheck disable=SC2034 # read by setup-runner.sh
+OLD_ALERT_URL_FILE="/etc/ghrunner/alert-url"
+# Kernel settings setup writes (/etc/sysctl.d/90-runner-hardening.conf) and doctor checks: ignore ICMP
+# redirects and source-routed packets (both let others reroute this VM's traffic), send no redirects,
+# and hide kernel addresses from unprivileged users.
+KERNEL_SETTINGS=(
+  net.ipv4.conf.all.accept_redirects=0
+  net.ipv4.conf.default.accept_redirects=0
+  net.ipv6.conf.all.accept_redirects=0
+  net.ipv6.conf.default.accept_redirects=0
+  net.ipv4.conf.all.send_redirects=0
+  net.ipv4.conf.default.send_redirects=0
+  net.ipv4.conf.all.accept_source_route=0
+  net.ipv6.conf.all.accept_source_route=0
+  kernel.kptr_restrict=2
+  kernel.dmesg_restrict=1
+)
 TOOL_CACHE_DIR="/opt/hostedtoolcache"
 
 # From a runner-lib.sh on stdin, prints its GHRUNNER_VERSION, or nothing for a copy older than 1.3.0.
@@ -297,15 +316,58 @@ clear_attention() {
   rm -f "${GHRUNNER_STATE_DIR}/attention/$1"
 }
 
-# Logs <title> and <message>, and posts them to the alert URL when one is set (an ntfy.sh topic, or any
-# URL that takes a plain-text POST). A failed post is logged, never fatal.
+# True for a Pushover user key or application token: 30 letters and digits.
+valid_pushover_key() {
+  [[ $1 =~ ^[A-Za-z0-9]{30}$ ]]
+}
+
+# Prints "<user key>\t<application token>" from the Pushover settings, or nothing when alerts are off.
+pushover_settings() {
+  [[ -r ${PUSHOVER_FILE} ]] || return 0
+  awk -F= '$1 == "PUSHOVER_USER" { user = $2 } $1 == "PUSHOVER_TOKEN" { token = $2 }
+    END { if (user != "" && token != "") print user "\t" token }' "${PUSHOVER_FILE}"
+}
+
+# Prints one form field as a curl config line, quoted the way curl's config files need.
+pushover_field() {
+  local value="${2//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  value="${value//$'\n'/\\n}"
+  printf 'form-string = "%s=%s"\n' "$1" "${value}"
+}
+
+# Posts the form fields on stdin (pushover_field lines) to Pushover's API at <path> and prints the reply.
+# The fields go to curl on stdin, so the token and user key never show in the process list.
+pushover_post() {
+  curl -sS --max-time 20 -K - "https://api.pushover.net/$1"
+}
+
+# True when Pushover's reply on stdin says the request worked ("status": 1).
+pushover_ok() {
+  [[ "$(jq -r '.status // 0' 2>/dev/null)" == "1" ]]
+}
+
+# True when Pushover accepts <user key> with <application token>, and the user has a device to alert.
+pushover_valid() {
+  { pushover_field token "$2"; pushover_field user "$1"; } | pushover_post 1/users/validate.json 2>/dev/null | pushover_ok
+}
+
+# Logs <title> and <message>, and sends them to Pushover when alerts are on. <priority> 1 (high) sounds
+# even in quiet hours; the audit uses it. A failed send is logged, never fatal.
 send_alert() {
-  local title="$1" message="$2" url=""
+  local title="$1" message="$2" priority="${3:-0}" user="" token=""
   logger -t ghrunner "${title}: ${message}"
-  if [[ -r ${ALERT_URL_FILE} ]]; then url="$(<"${ALERT_URL_FILE}")"; fi
-  [[ -n ${url} ]] || return 0
-  curl -fsS --max-time 20 -H "Title: $(hostname -s): ${title}" -H "Tags: warning" --data-binary "${message}" \
-    "${url}" >/dev/null 2>&1 || logger -t ghrunner "couldn't post the alert to the alert URL"
+  IFS=$'\t' read -r user token <<<"$(pushover_settings)"
+  [[ -n ${user} && -n ${token} ]] || return 0
+  if ! {
+    pushover_field token "${token}"
+    pushover_field user "${user}"
+    pushover_field title "$(hostname -s): ${title}"
+    pushover_field message "${message:0:1000}"
+    pushover_field priority "${priority}"
+  } | pushover_post 1/messages.json 2>/dev/null | pushover_ok; then
+    logger -t ghrunner "Pushover didn't take the alert"
+  fi
 }
 
 # ---------------------------------------------------------------------------------------------

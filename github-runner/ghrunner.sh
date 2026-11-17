@@ -854,7 +854,7 @@ audit_record() {
   digest="$(sha256sum <<<"${findings}" | cut -c1-16)"
   if [[ -f ${GHRUNNER_STATE_DIR}/audit-alerted ]]; then previous="$(<"${GHRUNNER_STATE_DIR}/audit-alerted")"; fi
   if [[ ${digest} != "${previous}" ]]; then
-    send_alert "audit found ${count} unexpected change(s)" "$(head -n 10 <<<"${findings}" | sed 's/\t/ /g')"
+    send_alert "audit found ${count} unexpected change(s)" "$(head -n 10 <<<"${findings}" | sed 's/\t/ /g')" 1
     echo "${digest}" >"${GHRUNNER_STATE_DIR}/audit-alerted"
   fi
 }
@@ -1093,11 +1093,14 @@ prune() {
 
 DOCTOR_ROWS=()
 DOCTOR_FAILED=0
+DOCTOR_FIXABLE=0
 
 # Records one check's result (PASS, WARN or FAIL) for the doctor table; any FAIL makes doctor exit 1.
+# <fix> "fix" marks a problem that running setup-runner.sh again fixes, so "doctor --fix" knows to run it.
 record() {
   DOCTOR_ROWS+=("$2"$'\t'"$1"$'\t'"$3")
   if [[ $1 == "FAIL" ]]; then DOCTOR_FAILED=1; fi
+  if [[ $1 != "PASS" && ${4:-} == "fix" ]]; then DOCTOR_FIXABLE=1; fi
 }
 
 # Grades a free-space percentage: under 10% fails, under 20% warns.
@@ -1152,7 +1155,7 @@ check_scheduled_jobs() {
     fi
   done
   if [[ -n ${problems} ]]; then
-    record FAIL "Scheduled jobs" "${problems}: run setup-runner.sh again"
+    record FAIL "Scheduled jobs" "${problems}" fix
   else
     record PASS "Scheduled jobs" "clean-up, weekly update and daily audit on"
   fi
@@ -1167,12 +1170,45 @@ firewall_on() {
   fi
 }
 
-# Firewall: runners only call out, so nothing but SSH should come in.
+# From "ufw status" on stdin and the SSH ports (arguments), prints what is wrong with the rules, one per
+# line: anything let in besides SSH, and an SSH port without a rate limit ("LIMIT").
+firewall_problems() {
+  awk -v ssh_ports=" $* " '
+    NR <= 2 || /^To / || /^--/ || NF < 2 { next }
+    {
+      line = $0; sub(/ \(v6\)/, "", line); split(line, field, /  +/)
+      target = field[1]; action = field[2]
+      if (action !~ /^(ALLOW|LIMIT)/) next
+      port = target; sub(/\/.*/, "", port)
+      if (port == "OpenSSH") port = "22"
+      if (index(ssh_ports, " " port " ") == 0) { if (!(target in other)) { other[target] = 1; print "also lets in " target } }
+      else if (action ~ /^ALLOW/ && !(target in unlimited)) { unlimited[target] = 1; print target " has no rate limit" }
+    }'
+}
+
+# The ports sshd listens on (root: sshd itself; others: the config files).
+ssh_ports() {
+  sshd_auth_settings 2>/dev/null | awk '$1 == "port" { print $2 }' | sort -un
+}
+
+# Firewall: runners only call out, so nothing but SSH (rate-limited) should come in.
 check_firewall() {
-  if firewall_on; then
-    record PASS "Firewall" "ufw on"
+  local problems
+  if ! firewall_on; then
+    record FAIL "Firewall" "ufw off" fix
+    return
+  fi
+  if [[ ${EUID} -ne 0 ]]; then
+    record PASS "Firewall" "ufw on (run with sudo to check its rules)"
+    return
+  fi
+  local -a ports
+  mapfile -t ports < <(ssh_ports)
+  problems="$(ufw status 2>/dev/null | firewall_problems "${ports[@]}" | paste -sd, - | sed 's/,/, /g')"
+  if [[ -n ${problems} ]]; then
+    record WARN "Firewall" "${problems}" fix
   else
-    record FAIL "Firewall" "ufw off: sudo ufw allow OpenSSH && sudo ufw enable"
+    record PASS "Firewall" "ufw on: only SSH, rate-limited"
   fi
 }
 
@@ -1200,8 +1236,9 @@ sshd_config_stream() {
   done <"${file}"
 }
 
-# From a config stream on stdin, prints the password and keyboard-interactive settings sshd would use:
-# sshd keeps the first value it reads, and skips Match blocks (they apply to some connections only).
+# From a config stream on stdin, prints the settings the SSH check needs, as sshd would use them: the first
+# value of each wins (every Port line counts), and Match blocks are skipped (they apply to some
+# connections only).
 sshd_first_values() {
   awk '
     /^#end-of-include/ { in_match = 0; next }
@@ -1213,40 +1250,121 @@ sshd_first_values() {
       if (key == "match") { in_match = (value != "all"); next }
       if (in_match) next
       if (key == "challengeresponseauthentication") key = "kbdinteractiveauthentication"
-      if ((key == "passwordauthentication" || key == "kbdinteractiveauthentication") && !(key in first)) first[key] = value
+      if (key == "port") { ports = ports " " field[2]; next }
+      if (key == "denyusers") { for (i = 2; i in field; i++) deny = deny " " field[i]; next }
+      if (key ~ /^(passwordauthentication|kbdinteractiveauthentication|permitrootlogin|maxauthtries)$/ && !(key in first)) first[key] = value
     }
     END {
       print "passwordauthentication " (("passwordauthentication" in first) ? first["passwordauthentication"] : "yes")
       print "kbdinteractiveauthentication " (("kbdinteractiveauthentication" in first) ? first["kbdinteractiveauthentication"] : "yes")
+      print "permitrootlogin " (("permitrootlogin" in first) ? first["permitrootlogin"] : "prohibit-password")
+      print "maxauthtries " (("maxauthtries" in first) ? first["maxauthtries"] : "6")
+      if (deny != "") print "denyusers" deny
+      n = split(ports == "" ? " 22" : ports, list, " ")
+      for (i = 1; i <= n; i++) if (list[i] != "") print "port " list[i]
     }'
 }
 
-# Prints sshd's effective password and keyboard-interactive settings: root asks sshd itself (sshd -T),
-# anyone else reads the config files. Fails when the files aren't all readable.
+# Prints sshd's effective settings for the SSH check: root asks sshd itself (sshd -T), anyone else reads
+# the config files. Fails when the files aren't all readable.
 sshd_auth_settings() {
   local settings
   if [[ ${EUID} -eq 0 ]] && settings="$(sshd -T 2>/dev/null)"; then
-    grep -E '^(passwordauthentication|kbdinteractiveauthentication|port) ' <<<"${settings}"
+    grep -E '^(passwordauthentication|kbdinteractiveauthentication|permitrootlogin|maxauthtries|denyusers|port) ' <<<"${settings}"
     return
   fi
   sshd_config_stream /etc/ssh/sshd_config /etc/ssh | sshd_first_values
 }
 
-# SSH: password login on an internet-facing VM invites brute force; keys only.
+# From SSH settings ("<keyword> <value>" lines) on stdin, prints each problem as "<FAIL|WARN> <text>".
+ssh_problems() {
+  awk -v runner="${RUNNER_USER}" '
+    $1 == "port" { ports = ports " " $2; count++ }
+    $1 == "denyusers" { for (i = 2; i <= NF; i++) if ($i == runner) barred = 1 }
+    { value[$1] = $2 }
+    END {
+      if (value["passwordauthentication"] != "no" || value["kbdinteractiveauthentication"] != "no") print "FAIL password login is on"
+      if (count > 1) print "WARN listening on ports" ports ": confirm the new one so the old one closes"
+      else if (ports == " 22") print "WARN on port 22, which every scanner tries"
+      if (value["permitrootlogin"] != "no") print "WARN root can log in (" value["permitrootlogin"] ")"
+      if (!barred) print "WARN the " runner " user can log in over SSH"
+      if (value["maxauthtries"] + 0 > 3) print "WARN " value["maxauthtries"] " tries per connection"
+    }'
+}
+
+# SSH: keys only, off port 22, root and the runner user can't log in, few tries per connection.
 check_ssh() {
-  local settings
+  local settings problems worst detail
   if ! settings="$(sshd_auth_settings)"; then
     if [[ ${EUID} -eq 0 ]]; then
-      record WARN "SSH keys only" "can't read the SSH settings (is openssh-server installed?)"
+      record WARN "SSH" "can't read the SSH settings (is openssh-server installed?)"
     else
-      record WARN "SSH keys only" "can't read every SSH config file: run with sudo"
+      record WARN "SSH" "can't read every SSH config file: run with sudo"
     fi
     return
   fi
-  if grep -qx 'passwordauthentication no' <<<"${settings}" && grep -qx 'kbdinteractiveauthentication no' <<<"${settings}"; then
-    record PASS "SSH keys only" "password login off$(awk '$1 == "port" { ports = ports " " $2 } END { if (ports) print "; port" ports }' <<<"${settings}")"
+  problems="$(ssh_problems <<<"${settings}")"
+  if [[ -z ${problems} ]]; then
+    record PASS "SSH" "keys only, port$(awk '$1 == "port" { printf " %s", $2 }' <<<"${settings}"), root and ${RUNNER_USER} can't log in"
+    return
+  fi
+  worst="WARN"
+  if grep -q '^FAIL' <<<"${problems}"; then worst="FAIL"; fi
+  detail="$(cut -d' ' -f2- <<<"${problems}" | paste -sd';' - | sed 's/;/; /g')"
+  record "${worst}" "SSH" "${detail}" fix
+}
+
+# Prints a kernel setting's current value.
+current_kernel_value() {
+  cat "/proc/sys/${1//.//}" 2>/dev/null
+}
+
+# Kernel network settings: the ones setup writes (KERNEL_SETTINGS) should be in force.
+check_kernel_settings() {
+  local setting key want have wrong=""
+  for setting in "${KERNEL_SETTINGS[@]}"; do
+    key="${setting%%=*}"
+    want="${setting#*=}"
+    have="$(current_kernel_value "${key}" || true)"
+    # A setting this kernel doesn't have (IPv6 turned off) can't be wrong.
+    if [[ -n ${have} && ${have} != "${want}" ]]; then wrong="${wrong:+${wrong}, }${key}=${have}"; fi
+  done
+  if [[ -n ${wrong} ]]; then
+    record WARN "Kernel settings" "not hardened: ${wrong}" fix
   else
-    record FAIL "SSH keys only" "password login is on: run setup-runner.sh again (needs an authorized key)"
+    record PASS "Kernel settings" "no redirects or source routing; kernel addresses hidden"
+  fi
+}
+
+# Security updates: Ubuntu's daily unattended upgrades, on and scheduled.
+check_security_updates() {
+  if [[ "$(dpkg-query -W -f='${Status}' unattended-upgrades 2>/dev/null)" == "install ok installed" ]] &&
+    grep -qs 'APT::Periodic::Unattended-Upgrade "1"' /etc/apt/apt.conf.d/20auto-upgrades &&
+    systemctl is-active --quiet apt-daily-upgrade.timer 2>/dev/null; then
+    record PASS "Security updates" "installed daily"
+  else
+    record WARN "Security updates" "daily unattended upgrades aren't on" fix
+  fi
+}
+
+# Docker: published ports must bind to 127.0.0.1, because Docker's rules bypass the firewall.
+check_docker_local() {
+  local address
+  address="$(jq -r '.ip // empty' /etc/docker/daemon.json 2>/dev/null || true)"
+  if [[ ${address} == "127.0.0.1" ]]; then
+    record PASS "Docker ports" "published on 127.0.0.1 only"
+  else
+    record FAIL "Docker ports" "published ports would be reachable from the internet (daemon.json ip: ${address:-unset})" fix
+  fi
+}
+
+# Alerts: without them, problems only show when you log in (root only: the settings are root's).
+check_alerts() {
+  [[ ${EUID} -eq 0 ]] || return 0
+  if [[ -n "$(pushover_settings)" ]]; then
+    record PASS "Alerts" "Pushover"
+  else
+    record WARN "Alerts" "off: problems only show at SSH login and here" fix
   fi
 }
 
@@ -1299,7 +1417,7 @@ check_sizing() {
     if [[ ${EUID} -eq 0 ]]; then label_mismatches; fi
   } | paste -sd, - | sed 's/,/, /g')"
   if [[ -n ${problems} ]]; then
-    record WARN "Sizing" "machine fits ${RUNNER_COUNT} per repository; ${problems}: sudo ghrunner resize"
+    record WARN "Sizing" "machine fits ${RUNNER_COUNT} per repository; ${problems}" fix
   else
     record PASS "Sizing" "${RUNNER_COUNT} runner(s) per repository fits $(memory_gb) GB, $(cpu_count) cores"
   fi
@@ -1326,11 +1444,11 @@ check_tool_settings() {
   local owner missing
   owner="$(stat -c %U "${TOOL_CACHE_DIR}" 2>/dev/null || true)"
   if [[ ${owner} != "${RUNNER_USER}" ]]; then
-    record WARN "Tool locations" "${TOOL_CACHE_DIR} ${owner:+is owned by ${owner}}${owner:-missing}: run setup-runner.sh again"
+    record WARN "Tool locations" "${TOOL_CACHE_DIR} ${owner:+is owned by ${owner}}${owner:-missing}" fix
   elif [[ ${EUID} -ne 0 ]]; then
     record PASS "Tool locations" "${TOOL_CACHE_DIR} ready (run with sudo to check each runner's .env)"
   elif missing="$(runners_missing_settings)" && [[ -n ${missing} ]]; then
-    record WARN "Tool locations" ".env settings missing for ${missing}: run setup-runner.sh again"
+    record WARN "Tool locations" ".env settings missing for ${missing}" fix
   else
     record PASS "Tool locations" "${TOOL_CACHE_DIR} ready; every runner's .env set"
   fi
@@ -1399,28 +1517,59 @@ check_swap() {
   elif ((swap > 0)); then
     record PASS "Swap" "$(human_bytes "${swap}") with ${memory} GB of memory"
   else
-    record WARN "Swap" "off with only ${memory} GB of memory: run setup-runner.sh again"
+    record WARN "Swap" "off with only ${memory} GB of memory" fix
   fi
 }
 
-# ghrunner doctor: runs every check, prints a PASS/WARN/FAIL table, exits 1 if anything failed.
-doctor() {
-  no_arguments "$@"
+# Runs every check and prints the PASS/WARN/FAIL table.
+run_checks() {
+  DOCTOR_ROWS=()
+  DOCTOR_FAILED=0
+  DOCTOR_FIXABLE=0
   check_disk
   check_docker
+  check_docker_local
   check_runner_services
   check_sizing
   check_public_repositories
   check_tool_settings
   check_scheduled_jobs
+  check_security_updates
   check_firewall
   check_ssh
+  check_kernel_settings
+  check_alerts
   check_audit
   check_kernel
   check_reboot
   check_swap
   check_ghrunner_version
   { printf 'CHECK\tRESULT\tDETAIL\n'; printf '%s\n' "${DOCTOR_ROWS[@]}"; } | print_table
+}
+
+# ghrunner doctor [--fix]: runs every check and prints a PASS/WARN/FAIL table; exits 1 if anything
+# failed. --fix: when a problem is one setup fixes, runs the installed setup-runner.sh (the same version,
+# nothing downloaded; it asks the usual questions), then checks again. Other problems say what to do.
+doctor() {
+  local fix="no"
+  case "${1:-}" in
+    "") ;;
+    --fix) fix="yes" ;;
+    *) die "usage: ghrunner doctor [--fix]" ;;
+  esac
+  if [[ ${fix} == "yes" ]]; then require_root; fi
+  run_checks
+  if [[ ${fix} == "yes" && ${DOCTOR_FIXABLE} -eq 1 ]]; then
+    [[ -f ${GHRUNNER_LIB_DIR}/setup-runner.sh ]] || die "${GHRUNNER_LIB_DIR}/setup-runner.sh is missing: run the one-line install"
+    log "Fixing: running setup-runner.sh ${GHRUNNER_VERSION} again"
+    if ! bash "${GHRUNNER_LIB_DIR}/setup-runner.sh"; then note "setup stopped; the reason is above"; fi
+    log "Checking again"
+    run_checks
+  elif [[ ${fix} == "yes" ]]; then
+    note "nothing here that setup fixes; any other problem above says what to do"
+  elif ((DOCTOR_FIXABLE)); then
+    note "Fix what setup can with: sudo ghrunner doctor --fix"
+  fi
   if ((DOCTOR_FAILED)); then exit 1; fi
 }
 
@@ -1442,7 +1591,7 @@ Commands                What it does                                            
   status                each runner: service, idle or busy, current job                     no
   stats [days]          jobs, results and durations (default 7 days), disk, memory          no
   prune                 run the weekly Docker clean-up now, show the space freed            yes
-  doctor                health checks as a PASS/WARN/FAIL table; exits 1 on a FAIL          no
+  doctor [--fix]        health checks; --fix runs setup again for what it fixes (sudo)      no
   audit [--accept]      list changes since the baseline (users, keys, sudo, ports...)       yes
   version               installed version, and whether main has a newer one                 no
   self-update [--yes]   update ghrunner and setup from main, after showing what changed     yes
