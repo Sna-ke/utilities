@@ -15,7 +15,7 @@
 # The version of these scripts. Every pull request that changes setup-runner.sh, runner-lib.sh or
 # ghrunner.sh raises it and adds a line to CHANGELOG.md; CI checks both (tests/version-check.sh).
 # shellcheck disable=SC2034 # read by the scripts that source this file
-GHRUNNER_VERSION="1.3.0"
+GHRUNNER_VERSION="1.4.0"
 
 GITHUB_OWNER="${GITHUB_OWNER:-Sna-ke}"
 # shellcheck disable=SC2034 # read by the scripts that source this file
@@ -34,6 +34,9 @@ GHRUNNER_LIB_DIR="/usr/local/lib/ghrunner"
 GHRUNNER_REPO="${GHRUNNER_REPO:-Sna-ke/utilities}"
 # shellcheck disable=SC2034 # read by the scripts that source this file
 GHRUNNER_FILES=(setup-runner.sh runner-lib.sh ghrunner.sh)
+# State that ghrunner keeps: the audit baseline, notes shown at login, and the alert URL (root only).
+GHRUNNER_STATE_DIR="/var/lib/ghrunner"
+ALERT_URL_FILE="/etc/ghrunner/alert-url"
 TOOL_CACHE_DIR="/opt/hostedtoolcache"
 
 # From a runner-lib.sh on stdin, prints its GHRUNNER_VERSION, or nothing for a copy older than 1.3.0.
@@ -46,12 +49,88 @@ version_newer() {
   [[ $1 != "$2" && "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n 1)" == "$1" ]]
 }
 
+# True when there is a terminal to ask questions on (not under cron, systemd or "self-update --yes").
+has_terminal() {
+  { true </dev/tty; } 2>/dev/null
+}
+
 # Prints a step heading, so long runs show where they are.
 log() { printf '\n==> %s\n' "$*"; }
 # Prints an indented detail line under the current step.
 note() { printf '    %s\n' "$*"; }
 # Prints an error and stops; every failure goes through here so messages look the same.
 die() { printf '\nERROR: %s\n' "$*" >&2; exit 1; }
+
+# ---------------------------------------------------------------------------------------------
+# Getting a version of these scripts from GitHub (install.sh, "ghrunner self-update")
+#
+# A version is a commit of GHRUNNER_REPO. Files are checked against the git blob hash GitHub reports
+# for them, so a cut-off or mixed download never runs.
+# ---------------------------------------------------------------------------------------------
+
+# Prints the git blob hash of a file (what "git hash-object" prints), to compare it with GitHub's.
+git_blob_sha() {
+  { printf 'blob %d\0' "$(stat -c %s "$1")"; cat "$1"; } | sha1sum | cut -d' ' -f1
+}
+
+# Calls GitHub's API for GHRUNNER_REPO (public, so no token; GITHUB_TOKEN is for the runner repositories).
+github_api() {
+  curl -fsSL --max-time 20 -H "Accept: application/vnd.github+json" \
+    "https://api.github.com/repos/${GHRUNNER_REPO}/$1"
+}
+
+# From GitHub's commit list on stdin, prints "<sha>\t<date>\t<title>" for each commit, newest first.
+parse_commits() {
+  jq -r '.[] | [.sha, (.commit.committer.date | .[0:10]), (.commit.message | split("\n")[0])] | join("\t")'
+}
+
+# Prints the commits on main that changed github-runner/, newest first (up to 30).
+latest_commits() {
+  github_api "commits?sha=main&path=github-runner&per_page=30" | parse_commits
+}
+
+# From a folder listing (GitHub's contents API) on stdin, prints "<name>\t<blob sha>" for each file.
+parse_blobs() {
+  jq -r '.[] | select(.type == "file") | [.name, .sha] | join("\t")'
+}
+
+# Prints "<name>\t<blob sha>" for github-runner's files at <commit>.
+blobs_at() {
+  github_api "contents/github-runner?ref=$1" | parse_blobs
+}
+
+# Downloads one of github-runner's files at <commit> and prints it.
+file_at() {
+  curl -fsSL --max-time 60 "https://raw.githubusercontent.com/${GHRUNNER_REPO}/$1/github-runner/$2"
+}
+
+# True when every file in <folder> matches the blob hashes ("<name>\t<sha>" lines) given.
+files_match() {
+  local folder="$1" blobs="$2" file want
+  for file in "${GHRUNNER_FILES[@]}"; do
+    want="$(awk -F'\t' -v name="${file}" '$1 == name { print $2 }' <<<"${blobs}")"
+    [[ -n ${want} && -f ${folder}/${file} && "$(git_blob_sha "${folder}/${file}")" == "${want}" ]] || return 1
+  done
+}
+
+# Downloads github-runner's files at <commit> into <folder> and checks each against GitHub's blob hash,
+# so a cut-off or mixed download never runs.
+download_version() {
+  local commit="$1" folder="$2" blobs="$3" file
+  for file in "${GHRUNNER_FILES[@]}"; do
+    curl -fsSL --max-time 60 -o "${folder}/${file}" \
+      "https://raw.githubusercontent.com/${GHRUNNER_REPO}/${commit}/github-runner/${file}"
+  done
+  files_match "${folder}" "${blobs}" || die "the downloaded files don't match GitHub's hashes for ${commit}"
+}
+
+# Asks a yes/no question on the terminal; anything but "y" or "yes" is no.
+confirm() {
+  local answer
+  printf '%s [y/N] ' "$1" >/dev/tty
+  read -r answer </dev/tty
+  [[ ${answer,,} == "y" || ${answer,,} == "yes" ]]
+}
 
 # ---------------------------------------------------------------------------------------------
 # Machine facts
@@ -176,6 +255,57 @@ repositories_with_runners() {
     [[ -f ${directory}.runner ]] || continue
     runner_repository "${directory%/}" || true
   done | sort -fu
+}
+
+# Turns GitHub's answer to GET /repos/<owner>/<repo> without a token (<HTTP status> and <body>) into
+# "public", "private" or "unknown". Without a token GitHub hides private repositories, so 404 means private.
+visibility_from_response() {
+  case "$1" in
+    200) jq -r 'if .private then "private" else "public" end' <<<"$2" 2>/dev/null || echo "unknown" ;;
+    404) echo "private" ;;
+    *) echo "unknown" ;;
+  esac
+}
+
+# Prints "public", "private" or "unknown" (GitHub unreachable) for a repository ("owner/repo").
+repository_visibility() {
+  local response
+  response="$(curl -sS --max-time 20 -w '\n%{http_code}' "https://api.github.com/repos/$1" 2>/dev/null)" || {
+    echo "unknown"
+    return
+  }
+  visibility_from_response "${response##*$'\n'}" "${response%$'\n'*}"
+}
+
+# Why runners are never registered for a public repository, for messages.
+PUBLIC_REPOSITORY_WHY="it is a public repository: anyone can open a pull request there, and on a self-hosted \
+runner its workflow would run as root on this VM. Use GitHub's hosted runners for it."
+
+# ---------------------------------------------------------------------------------------------
+# Alerts and notes for the next login
+# ---------------------------------------------------------------------------------------------
+
+# Records something that needs attention under <topic> (e.g. audit, update); shown at every SSH login
+# (/etc/update-motd.d/95-ghrunner) and by "ghrunner doctor" until cleared. Text comes on stdin.
+set_attention() {
+  install -d -m 0755 "${GHRUNNER_STATE_DIR}/attention"
+  cat >"${GHRUNNER_STATE_DIR}/attention/$1"
+}
+
+# Clears the note under <topic>.
+clear_attention() {
+  rm -f "${GHRUNNER_STATE_DIR}/attention/$1"
+}
+
+# Logs <title> and <message>, and posts them to the alert URL when one is set (an ntfy.sh topic, or any
+# URL that takes a plain-text POST). A failed post is logged, never fatal.
+send_alert() {
+  local title="$1" message="$2" url=""
+  logger -t ghrunner "${title}: ${message}"
+  if [[ -r ${ALERT_URL_FILE} ]]; then url="$(<"${ALERT_URL_FILE}")"; fi
+  [[ -n ${url} ]] || return 0
+  curl -fsS --max-time 20 -H "Title: $(hostname -s): ${title}" -H "Tags: warning" --data-binary "${message}" \
+    "${url}" >/dev/null 2>&1 || logger -t ghrunner "couldn't post the alert to the alert URL"
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -401,6 +531,7 @@ install_runner() {
   labels="$(expected_labels "${slug}" "${index}")"
 
   log "Runner ${name} (labels: ${labels})"
+  [[ "$(repository_visibility "${full}")" != "public" ]] || die "not registering ${name}: ${PUBLIC_REPOSITORY_WHY}"
   if [[ -f ${directory}/.runner ]]; then
     note "already registered"
     return
@@ -459,12 +590,12 @@ remove_runner() {
 # ---------------------------------------------------------------------------------------------
 
 RESIZE_ROWS=()
-RESIZE_TODO=()
+STILL_TO_DO=()
 RUNNER_ARCHIVE=""
 
 # True when registration and removal tokens can be had: GITHUB_TOKEN, or a terminal to paste them in.
 token_available() {
-  [[ -n ${GITHUB_TOKEN:-} ]] || { true </dev/tty; } 2>/dev/null
+  [[ -n ${GITHUB_TOKEN:-} ]] || has_terminal
 }
 
 # The how-to for a step that needed a token and had none.
@@ -477,7 +608,7 @@ resize_result() {
   local runner="$1" change="$2" result="$3" how="${4:-}"
   note "${runner}: ${change}: ${result}"
   RESIZE_ROWS+=("${runner}"$'\t'"${change}"$'\t'"${result}")
-  if [[ -n ${how} ]]; then RESIZE_TODO+=("${runner} (${change}): ${how}"); fi
+  if [[ -n ${how} ]]; then STILL_TO_DO+=("${runner} (${change}): ${how}"); fi
 }
 
 # Adds runner <index> of a repository: downloads the release once per run, then installs it.
@@ -543,6 +674,11 @@ resize_repository() {
   local -A present=()
   slug="$(repository_slug "${full}")"
   log "${full}: ${RUNNER_COUNT} runner(s), stack label ${STACK_LABEL}"
+  if [[ "$(repository_visibility "${full}")" == "public" ]]; then
+    resize_result "${full}" "add, relabel or remove runners" "not done" "${PUBLIC_REPOSITORY_WHY} \
+Remove any runners it has with 'sudo ghrunner delete ${full}'."
+    return
+  fi
   while IFS=$'\t' read -r index directory; do
     present["${index}"]="${directory}"
   done < <(repository_runner_dirs "${full}")
