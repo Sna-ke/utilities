@@ -241,6 +241,10 @@ create_runner_user() {
   visudo -cqf "${sudoers}.new" || die "sudoers file failed its check"
   chmod 440 "${sudoers}.new"
   mv "${sudoers}.new" "${sudoers}"
+
+  # actions/setup-dotnet installs into /usr/share/dotnet, which GitHub's own images make writable.
+  # Without this, every .NET job fails with "cannot create directory '/usr/share/dotnet'".
+  install -d -o "${RUNNER_USER}" -g "${RUNNER_USER}" /usr/share/dotnet
 }
 
 # Downloads the latest runner release once and checks it against GitHub's published SHA-256:
