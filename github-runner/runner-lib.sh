@@ -1,8 +1,9 @@
 # shellcheck shell=bash
-# Shared by setup-runner.sh and ghrunner.sh: settings, messages, machine facts, and the code that downloads,
-# verifies, registers and unregisters runners. Sourced, never run on its own.
+# The GitHub runner component: settings, the code that downloads, registers, resizes and unregisters
+# runners, its doctor checks, and its hostctl hooks (prefix "runner", see host/host-lib.sh). Sourced by
+# ghrunner.sh and by hostctl, after host/host-lib.sh; never run on its own.
 #
-# Conventions both scripts rely on:
+# Conventions:
 #   - runners live in /home/runner/<repo-lowercase>-<n>
 #   - runner names are <hostname>-<repo-lowercase>-<n>
 #   - labels are <repo>-ci, plus <repo>-stack on runner 1 when the machine has 6 GB of RAM or more
@@ -10,155 +11,28 @@
 #   - each runner's .env file sets where tools install (runner_env_settings), because the setup actions
 #     assume GitHub's own runner image, where system folders are writable
 #
-# Secrets: none. GITHUB_TOKEN is read from the environment and never written to disk.
+# Settings (environment variables, all optional):
+#   RUNNER_REPOS        [GroundCore]  repositories to serve, comma-separated ("repo" or "owner/repo")
+#   GITHUB_OWNER        [Sna-ke]      owner of repositories given without one
+#   RUNNER_COUNT        [auto]        runners per repository; auto = one per 5 GB of RAM and 3 cores, at least 1
+#   STACK_LABEL         [auto]        add <repo>-stack to runner 1; auto = yes with 6 GB of RAM or more
+#   RUNNER_NAME_PREFIX  [hostname]    runner names are <prefix>-<repo>-<n>
+#   GITHUB_TOKEN        [none]        fine-grained token (Administration: read and write) for registering;
+#                                     never written to disk. Without it, setup asks you to paste tokens.
 
-# The version of these scripts. Every pull request that changes setup-runner.sh, runner-lib.sh or
-# ghrunner.sh raises it and adds a line to CHANGELOG.md; CI checks both (tests/version-check.sh).
-# shellcheck disable=SC2034 # read by the scripts that source this file
-GHRUNNER_VERSION="1.5.0"
-
+RUNNER_REPOS="${RUNNER_REPOS:-GroundCore}"
 GITHUB_OWNER="${GITHUB_OWNER:-Sna-ke}"
-# shellcheck disable=SC2034 # read by the scripts that source this file
 RUNNER_COUNT="${RUNNER_COUNT:-auto}"
 STACK_LABEL="${STACK_LABEL:-auto}"
 RUNNER_NAME_PREFIX="${RUNNER_NAME_PREFIX:-$(hostname -s)}"
 RUNNER_USER="runner"
 RUNNER_HOME="/home/${RUNNER_USER}"
 DOWNLOAD_DIR="/var/cache/actions-runner"
-# shellcheck disable=SC2034 # read by the scripts that source this file
-PRUNE_SCRIPT="/etc/cron.weekly/docker-prune"
-# shellcheck disable=SC2034 # read by the scripts that source this file
-GHRUNNER_LIB_DIR="/usr/local/lib/ghrunner"
-# Where "ghrunner self-update" gets new versions, and the files that make up one.
-# shellcheck disable=SC2034 # read by the scripts that source this file
-GHRUNNER_REPO="${GHRUNNER_REPO:-Sna-ke/utilities}"
-# shellcheck disable=SC2034 # read by the scripts that source this file
-GHRUNNER_FILES=(setup-runner.sh runner-lib.sh ghrunner.sh)
-# State that ghrunner keeps: the audit baseline, notes shown at login, and the alert URL (root only).
-GHRUNNER_STATE_DIR="/var/lib/ghrunner"
-# Pushover user key and application token for alerts (PUSHOVER_USER=..., PUSHOVER_TOKEN=...), root only.
-PUSHOVER_FILE="/etc/ghrunner/pushover"
-# 1.4.0 posted alerts to a URL kept here; Pushover replaced it and setup removes the file.
-# shellcheck disable=SC2034 # read by setup-runner.sh
-OLD_ALERT_URL_FILE="/etc/ghrunner/alert-url"
-# Kernel settings setup writes (/etc/sysctl.d/90-runner-hardening.conf) and doctor checks: ignore ICMP
-# redirects and source-routed packets (both let others reroute this VM's traffic), send no redirects,
-# and hide kernel addresses from unprivileged users.
-KERNEL_SETTINGS=(
-  net.ipv4.conf.all.accept_redirects=0
-  net.ipv4.conf.default.accept_redirects=0
-  net.ipv6.conf.all.accept_redirects=0
-  net.ipv6.conf.default.accept_redirects=0
-  net.ipv4.conf.all.send_redirects=0
-  net.ipv4.conf.default.send_redirects=0
-  net.ipv4.conf.all.accept_source_route=0
-  net.ipv6.conf.all.accept_source_route=0
-  kernel.kptr_restrict=2
-  kernel.dmesg_restrict=1
-)
 TOOL_CACHE_DIR="/opt/hostedtoolcache"
-
-# From a runner-lib.sh on stdin, prints its GHRUNNER_VERSION, or nothing for a copy older than 1.3.0.
-version_from_text() {
-  sed -nE 's/^GHRUNNER_VERSION="([^"]+)".*/\1/p' | head -n 1
-}
-
-# True when version <a> is newer than <b> (numeric order: 1.10.0 is newer than 1.9.0).
-version_newer() {
-  [[ $1 != "$2" && "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n 1)" == "$1" ]]
-}
-
-# True when there is a terminal to ask questions on (not under cron, systemd or "self-update --yes").
-has_terminal() {
-  { true </dev/tty; } 2>/dev/null
-}
-
-# Prints a step heading, so long runs show where they are.
-log() { printf '\n==> %s\n' "$*"; }
-# Prints an indented detail line under the current step.
-note() { printf '    %s\n' "$*"; }
-# Prints an error and stops; every failure goes through here so messages look the same.
-die() { printf '\nERROR: %s\n' "$*" >&2; exit 1; }
-
-# ---------------------------------------------------------------------------------------------
-# Getting a version of these scripts from GitHub (install.sh, "ghrunner self-update")
-#
-# A version is a commit of GHRUNNER_REPO. Files are checked against the git blob hash GitHub reports
-# for them, so a cut-off or mixed download never runs.
-# ---------------------------------------------------------------------------------------------
-
-# Prints the git blob hash of a file (what "git hash-object" prints), to compare it with GitHub's.
-git_blob_sha() {
-  { printf 'blob %d\0' "$(stat -c %s "$1")"; cat "$1"; } | sha1sum | cut -d' ' -f1
-}
-
-# Calls GitHub's API for GHRUNNER_REPO (public, so no token; GITHUB_TOKEN is for the runner repositories).
-github_api() {
-  curl -fsSL --max-time 20 -H "Accept: application/vnd.github+json" \
-    "https://api.github.com/repos/${GHRUNNER_REPO}/$1"
-}
-
-# From GitHub's commit list on stdin, prints "<sha>\t<date>\t<title>" for each commit, newest first.
-parse_commits() {
-  jq -r '.[] | [.sha, (.commit.committer.date | .[0:10]), (.commit.message | split("\n")[0])] | join("\t")'
-}
-
-# Prints the commits on main that changed github-runner/, newest first (up to 30).
-latest_commits() {
-  github_api "commits?sha=main&path=github-runner&per_page=30" | parse_commits
-}
-
-# From a folder listing (GitHub's contents API) on stdin, prints "<name>\t<blob sha>" for each file.
-parse_blobs() {
-  jq -r '.[] | select(.type == "file") | [.name, .sha] | join("\t")'
-}
-
-# Prints "<name>\t<blob sha>" for github-runner's files at <commit>.
-blobs_at() {
-  github_api "contents/github-runner?ref=$1" | parse_blobs
-}
-
-# Downloads one of github-runner's files at <commit> and prints it.
-file_at() {
-  curl -fsSL --max-time 60 "https://raw.githubusercontent.com/${GHRUNNER_REPO}/$1/github-runner/$2"
-}
-
-# True when every file in <folder> matches the blob hashes ("<name>\t<sha>" lines) given.
-files_match() {
-  local folder="$1" blobs="$2" file want
-  for file in "${GHRUNNER_FILES[@]}"; do
-    want="$(awk -F'\t' -v name="${file}" '$1 == name { print $2 }' <<<"${blobs}")"
-    [[ -n ${want} && -f ${folder}/${file} && "$(git_blob_sha "${folder}/${file}")" == "${want}" ]] || return 1
-  done
-}
-
-# Downloads github-runner's files at <commit> into <folder> and checks each against GitHub's blob hash,
-# so a cut-off or mixed download never runs.
-download_version() {
-  local commit="$1" folder="$2" blobs="$3" file
-  for file in "${GHRUNNER_FILES[@]}"; do
-    curl -fsSL --max-time 60 -o "${folder}/${file}" \
-      "https://raw.githubusercontent.com/${GHRUNNER_REPO}/${commit}/github-runner/${file}"
-  done
-  files_match "${folder}" "${blobs}" || die "the downloaded files don't match GitHub's hashes for ${commit}"
-}
-
-# Asks a yes/no question on the terminal; anything but "y" or "yes" is no.
-confirm() {
-  local answer
-  printf '%s [y/N] ' "$1" >/dev/tty
-  read -r answer </dev/tty
-  [[ ${answer,,} == "y" || ${answer,,} == "yes" ]]
-}
 
 # ---------------------------------------------------------------------------------------------
 # Machine facts
 # ---------------------------------------------------------------------------------------------
-
-# Total memory in whole gigabytes, rounded to the nearest (a "4 GB" VPS reports about 3.8).
-memory_gb() {
-  awk '/MemTotal/ { printf "%d", ($2 / 1024 / 1024) + 0.5 }' /proc/meminfo
-}
 
 # The runner release's name for this CPU.
 runner_architecture() {
@@ -167,11 +41,6 @@ runner_architecture() {
     aarch64) echo "arm64" ;;
     *) die "unsupported CPU architecture: $(uname -m)" ;;
   esac
-}
-
-# Number of CPU cores.
-cpu_count() {
-  nproc
 }
 
 # Runners per repository for <memory GB> and <cores>: each runner gets at least 5 GB and 3 cores, and
@@ -301,76 +170,6 @@ PUBLIC_REPOSITORY_WHY="it is a public repository: anyone can open a pull request
 runner its workflow would run as root on this VM. Use GitHub's hosted runners for it."
 
 # ---------------------------------------------------------------------------------------------
-# Alerts and notes for the next login
-# ---------------------------------------------------------------------------------------------
-
-# Records something that needs attention under <topic> (e.g. audit, update); shown at every SSH login
-# (/etc/update-motd.d/95-ghrunner) and by "ghrunner doctor" until cleared. Text comes on stdin.
-set_attention() {
-  install -d -m 0755 "${GHRUNNER_STATE_DIR}/attention"
-  cat >"${GHRUNNER_STATE_DIR}/attention/$1"
-}
-
-# Clears the note under <topic>.
-clear_attention() {
-  rm -f "${GHRUNNER_STATE_DIR}/attention/$1"
-}
-
-# True for a Pushover user key or application token: 30 letters and digits.
-valid_pushover_key() {
-  [[ $1 =~ ^[A-Za-z0-9]{30}$ ]]
-}
-
-# Prints "<user key>\t<application token>" from the Pushover settings, or nothing when alerts are off.
-pushover_settings() {
-  [[ -r ${PUSHOVER_FILE} ]] || return 0
-  awk -F= '$1 == "PUSHOVER_USER" { user = $2 } $1 == "PUSHOVER_TOKEN" { token = $2 }
-    END { if (user != "" && token != "") print user "\t" token }' "${PUSHOVER_FILE}"
-}
-
-# Prints one form field as a curl config line, quoted the way curl's config files need.
-pushover_field() {
-  local value="${2//\\/\\\\}"
-  value="${value//\"/\\\"}"
-  value="${value//$'\n'/\\n}"
-  printf 'form-string = "%s=%s"\n' "$1" "${value}"
-}
-
-# Posts the form fields on stdin (pushover_field lines) to Pushover's API at <path> and prints the reply.
-# The fields go to curl on stdin, so the token and user key never show in the process list.
-pushover_post() {
-  curl -sS --max-time 20 -K - "https://api.pushover.net/$1"
-}
-
-# True when Pushover's reply on stdin says the request worked ("status": 1).
-pushover_ok() {
-  [[ "$(jq -r '.status // 0' 2>/dev/null)" == "1" ]]
-}
-
-# True when Pushover accepts <user key> with <application token>, and the user has a device to alert.
-pushover_valid() {
-  { pushover_field token "$2"; pushover_field user "$1"; } | pushover_post 1/users/validate.json 2>/dev/null | pushover_ok
-}
-
-# Logs <title> and <message>, and sends them to Pushover when alerts are on. <priority> 1 (high) sounds
-# even in quiet hours; the audit uses it. A failed send is logged, never fatal.
-send_alert() {
-  local title="$1" message="$2" priority="${3:-0}" user="" token=""
-  logger -t ghrunner "${title}: ${message}"
-  IFS=$'\t' read -r user token <<<"$(pushover_settings)"
-  [[ -n ${user} && -n ${token} ]] || return 0
-  if ! {
-    pushover_field token "${token}"
-    pushover_field user "${user}"
-    pushover_field title "$(hostname -s): ${title}"
-    pushover_field message "${message:0:1000}"
-    pushover_field priority "${priority}"
-  } | pushover_post 1/messages.json 2>/dev/null | pushover_ok; then
-    logger -t ghrunner "Pushover didn't take the alert"
-  fi
-}
-
-# ---------------------------------------------------------------------------------------------
 # Labels
 #
 # The runner keeps no local copy of its labels, so registration records them in <folder>/.labels.
@@ -415,11 +214,6 @@ recorded_labels() {
 # Prints the actions.runner.* unit named in a /proc/<pid>/cgroup file read from stdin.
 unit_from_cgroup() {
   grep -m 1 -oE 'actions\.runner\.[^/]*\.service'
-}
-
-# True when <unit> is one of the lines of <list> (e.g. the busy units).
-unit_in_list() {
-  [[ -n $1 ]] && grep -qxF -- "$1" <<<"$2"
 }
 
 # Prints the unit of every runner with a Runner.Worker process, i.e. a job in progress. The worker runs
@@ -652,7 +446,6 @@ remove_runner() {
 # ---------------------------------------------------------------------------------------------
 
 RESIZE_ROWS=()
-STILL_TO_DO=()
 RUNNER_ARCHIVE=""
 
 # True when registration and removal tokens can be had: GITHUB_TOKEN, or a terminal to paste them in.
@@ -760,4 +553,425 @@ Remove any runners it has with 'sudo ghrunner delete ${full}'."
     directory="${present[${index}]}"
     resize_remove "${directory}" "$(runner_config_value "${directory}/.runner" agentName)"
   done < <(printf '%s\n' "${!present[@]}" | sort -rn)
+}
+
+# ---------------------------------------------------------------------------------------------
+# Finding runners and reading their output
+#
+# Runner folders under /home/runner are only readable by root (Ubuntu makes home folders 0750), so the
+# read-only commands find runners through systemd, which any user can query.
+# ---------------------------------------------------------------------------------------------
+
+# From "systemctl list-units --plain --no-legend" on stdin, prints "<unit>\t<active state>" for each
+# runner unit. Skips the "●" systemd puts before failed units.
+parse_unit_list() {
+  awk '{
+    for (i = 1; i <= NF; i++) if ($i ~ /^actions\.runner\..*\.service$/) { print $i "\t" $(i + 2); next }
+  }'
+}
+
+# Lists every runner unit systemd has loaded, running or not.
+runner_units() {
+  systemctl list-units --all --plain --no-legend --no-pager --type=service 'actions.runner.*' 2>/dev/null |
+    parse_unit_list || true
+}
+
+# Undoes systemd's \xNN escaping in a unit name (the runner's svc.sh may escape "-" as \x2d).
+decode_unit_name() {
+  printf '%b' "$1"
+}
+
+# For a unit named by our conventions, actions.runner.<owner>-<repo>.<prefix>-<repo-lowercase>-<n>.service,
+# prints "<runner name>\t<repo-lowercase>\t<n>". Fails for any other name (renamed or truncated units).
+parse_unit_name() {
+  local text lower match prefix slug index length
+  text="$(decode_unit_name "$1")"
+  text="${text#actions.runner.}"
+  text="${text%.service}"
+  lower="$(tr '[:upper:]' '[:lower:]' <<<"${text}")"
+  # The repository appears twice: after the owner, and inside the runner name. \1 makes them agree.
+  match="$(sed -nE 's/^[^.]*-(.+)\.([^.]*)-\1-([0-9]+)$/\2\t\1\t\3/p' <<<"${lower}")"
+  [[ -n ${match} ]] || return 1
+  IFS=$'\t' read -r prefix slug index <<<"${match}"
+  length=$((${#prefix} + ${#slug} + ${#index} + 2))
+  printf '%s\t%s\t%s\n' "${text: -length}" "${slug}" "${index}"
+}
+
+# Prints "<runner name>\t<repo-lowercase>\t<n>" for any runner unit: from its name when it follows the
+# conventions, else from its folder (<repo-lowercase>-<n>), else the bare unit name for a removed runner.
+unit_identity() {
+  local unit="$1" parsed directory base
+  parsed="$(parse_unit_name "${unit}")" || parsed=""
+  if [[ -n ${parsed} ]]; then
+    echo "${parsed}"
+    return
+  fi
+  directory="$(systemctl show -p WorkingDirectory --value "${unit}" 2>/dev/null || true)"
+  base="${directory##*/}"
+  if [[ ${base} =~ ^(.+)-([0-9]+)$ ]]; then
+    printf '%s\t%s\t%s\n' "${base}" "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
+    return
+  fi
+  base="$(decode_unit_name "${unit}")"
+  base="${base#actions.runner.}"
+  printf '%s\tunknown\t-\n' "${base%.service}"
+}
+
+# Prints runner folders that have a .runner file but no installed service (only visible to root).
+unserviced_runner_dirs() {
+  local directory units
+  units="$(runner_units | cut -f1)"
+  for directory in "${RUNNER_HOME}"/*/; do
+    directory="${directory%/}"
+    [[ -f ${directory}/.runner ]] || continue
+    if [[ -f ${directory}/.service ]] && unit_in_list "$(<"${directory}/.service")" "${units}"; then continue; fi
+    echo "${directory}"
+  done
+}
+
+# Prints the last <count> lines a runner unit wrote (message text only). Empty when the journal isn't
+# readable for this user.
+unit_journal() {
+  journalctl -u "$1" -n "${2:-500}" -o cat --no-pager 2>/dev/null || true
+}
+
+# From runner output on stdin, prints the name of the most recently started job.
+last_started_job() {
+  sed -nE 's/^.*Running job: (.*)$/\1/p' | tail -n 1
+}
+
+# From runner output on stdin, prints the version the runner reported when it last started.
+last_reported_version() {
+  sed -nE "s/^.*Current runner version: '([^']+)'.*$/\1/p" | tail -n 1
+}
+
+# From "journalctl -o json" on stdin, prints "<epoch seconds>\t<unit>\t<message>" for each job start
+# ("Running job: X") and end ("Job X completed with result: Y"). Not @tsv: it would double the
+# backslashes in systemd-escaped unit names (\x2d), and they must match systemctl's spelling.
+journal_json_to_events() {
+  jq -r 'select((.MESSAGE | type) == "string")
+    | select(.MESSAGE | test("Running job: |completed with result: "))
+    | [(.__REALTIME_TIMESTAMP | tonumber / 1000000 | floor | tostring), (._SYSTEMD_UNIT // ""), .MESSAGE]
+    | map(gsub("[\t\n\r]"; " ")) | join("\t")'
+}
+
+# Prints job start and end events of every runner, past and present, for the last <days> days.
+job_events() {
+  journalctl -u 'actions.runner.*' --since "$1 days ago" -o json --output-fields=MESSAGE,_SYSTEMD_UNIT \
+    --no-pager 2>/dev/null | journal_json_to_events || true
+}
+
+# Reads "M\t<unit>\t<runner name>\t<repo>" lines (which runner and repository each unit is) followed by
+# "E\t<epoch>\t<unit>\t<message>" events, and prints one row per runner or repository (by = runner |
+# repository): started, completed, succeeded, failed, cancelled, other results, average duration.
+# A job's duration is the time between its start and end lines on the same runner.
+summarize_jobs() {
+  awk -F'\t' -v by="$1" '
+    function duration(s) {
+      s = int(s + 0.5)
+      if (s >= 3600) return sprintf("%dh %02dm", int(s / 3600), int((s % 3600) / 60))
+      if (s >= 60) return sprintf("%dm %02ds", int(s / 60), s % 60)
+      return s "s"
+    }
+    $1 == "M" { group[$2] = (by == "repository") ? $4 : $3; next }
+    $1 != "E" { next }
+    {
+      unit = $3
+      key = (unit in group) ? group[unit] : unit
+      seen[key] = 1
+      if ($4 ~ /Running job: /) {
+        started[key]++
+        start[unit] = $2
+      } else if (match($4, /completed with result: [A-Za-z]+/)) {
+        result = substr($4, RSTART + 23, RLENGTH - 23)
+        completed[key]++
+        if (result == "Succeeded") succeeded[key]++
+        else if (result == "Failed") failed[key]++
+        else if (result == "Canceled" || result == "Cancelled") cancelled[key]++
+        else other[key]++
+        if (unit in start) { total[key] += $2 - start[unit]; timed[key]++; delete start[unit] }
+      }
+    }
+    END {
+      for (key in seen) {
+        printf "%s\t%d\t%d\t%d\t%d\t%d\t%d\t%s\n", key, started[key], completed[key], succeeded[key],
+          failed[key], cancelled[key], other[key], (timed[key] ? duration(total[key] / timed[key]) : "-")
+      }
+    }' | sort
+}
+
+# Prints the version a runner reports: from its journal, or by asking its binary when the folder is
+# readable (root). "unknown" if neither works.
+runner_version() {
+  local unit="$1" version directory
+  version="$(unit_journal "${unit}" 5000 | last_reported_version)"
+  if [[ -z ${version} ]]; then
+    directory="$(systemctl show -p WorkingDirectory --value "${unit}" 2>/dev/null || true)"
+    if [[ -n ${directory} && -x ${directory}/bin/Runner.Listener ]]; then
+      version="$(timeout 30 "${directory}/bin/Runner.Listener" --version 2>/dev/null | tr -d '[:space:]' || true)"
+    fi
+  fi
+  echo "${version:-unknown}"
+}
+
+# Prints the latest runner release's version from GitHub, or "unknown" when GitHub can't be reached.
+latest_runner_version() {
+  curl -fsSL --max-time 20 https://api.github.com/repos/actions/runner/releases/latest 2>/dev/null |
+    jq -r '.tag_name | ltrimstr("v")' 2>/dev/null || echo "unknown"
+}
+
+# Compares a runner's version with the latest release, in words for the update table.
+version_status() {
+  local version="$1" latest="$2"
+  if [[ ${version} == "unknown" || ${latest} == "unknown" ]]; then
+    echo "can't tell"
+  elif [[ ${version} == "${latest}" ]]; then
+    echo "up to date"
+  elif [[ "$(printf '%s\n%s\n' "${version}" "${latest}" | sort -V | head -n 1)" == "${version}" ]]; then
+    echo "older: it updates itself"
+  else
+    echo "newer than the latest release"
+  fi
+}
+
+# Waits until no runner is running a job, checking every minute for up to <minutes>. Fails if they
+# stay busy that long.
+wait_until_idle() {
+  local minutes="$1" waited=0
+  while [[ -n "$(busy_units)" ]]; do
+    ((waited < minutes)) || return 1
+    sleep 60
+    waited=$((waited + 1))
+  done
+}
+
+PAUSED_UNITS=()
+
+# Stops every running runner, so no job starts while packages (Docker among them) are upgraded.
+pause_runners() {
+  local unit active
+  while IFS=$'\t' read -r unit active; do
+    [[ ${active} == "active" ]] || continue
+    systemctl stop "${unit}"
+    PAUSED_UNITS+=("${unit}")
+  done < <(runner_units)
+}
+
+# Starts the runners pause_runners stopped.
+resume_runners() {
+  local unit
+  for unit in "${PAUSED_UNITS[@]}"; do systemctl start "${unit}" || true; done
+  PAUSED_UNITS=()
+}
+
+# ---------------------------------------------------------------------------------------------
+# Doctor checks
+# ---------------------------------------------------------------------------------------------
+
+# Runner services: a stopped service means GitHub shows the runner offline and jobs queue.
+check_runner_services() {
+  local units stopped
+  units="$(runner_units)"
+  if [[ -z ${units} ]]; then
+    record WARN "Runner services" "no runners on this machine"
+    return
+  fi
+  stopped="$(awk -F'\t' '$2 != "active" { print $1 }' <<<"${units}" | while read -r unit; do
+    unit_identity "${unit}" | cut -f1
+  done | paste -sd, -)"
+  if [[ -n ${stopped} ]]; then
+    record FAIL "Runner services" "not active: ${stopped}"
+  else
+    record PASS "Runner services" "$(wc -l <<<"${units}") active"
+  fi
+}
+
+# Lists runner folders whose .env lacks any of runner_env_settings, comma-separated (root only).
+runners_missing_settings() {
+  local directory setting
+  for directory in "${RUNNER_HOME}"/*/; do
+    directory="${directory%/}"
+    [[ -f ${directory}/.runner ]] || continue
+    while read -r setting; do
+      if ! grep -qxF -- "${setting}" "${directory}/.env" 2>/dev/null; then
+        echo "${directory##*/}"
+        break
+      fi
+    done < <(runner_env_settings "${directory}")
+  done | paste -sd, -
+}
+
+# From runner unit identities ("<name>\t<repo>\t<n>") on stdin, prints "<repo> has <n>" for each
+# repository whose runner count isn't <wanted>.
+count_mismatches() {
+  awk -F'\t' -v wanted="$1" '$2 != "unknown" { count[$2]++ }
+    END { for (repo in count) if (count[repo] != wanted) printf "%s has %d\n", repo, count[repo] }' | sort
+}
+
+# Lists runners (root only: .labels is in their folders) whose recorded labels differ from the rule.
+label_mismatches() {
+  local full index directory
+  while read -r full; do
+    while IFS=$'\t' read -r index directory; do
+      [[ -f ${directory}/.labels ]] || continue
+      if [[ "$(sort_labels <"${directory}/.labels")" != "$(expected_labels "$(repository_slug "${full}")" "${index}" | sort_labels)" ]]; then
+        echo "${directory##*/} labels"
+      fi
+    done < <(repository_runner_dirs "${full}")
+  done < <(repositories_with_runners)
+}
+
+# Sizing: after the VM is resized, the runners and stack label no longer match what it fits.
+check_sizing() {
+  local units problems
+  units="$(runner_units)"
+  if [[ -z ${units} ]]; then
+    record PASS "Sizing" "no runners"
+    return
+  fi
+  resolve_runner_settings
+  problems="$({
+    while IFS=$'\t' read -r unit _; do unit_identity "${unit}"; done <<<"${units}" | count_mismatches "${RUNNER_COUNT}"
+    if [[ ${EUID} -eq 0 ]]; then label_mismatches; fi
+  } | paste -sd, - | sed 's/,/, /g')"
+  if [[ -n ${problems} ]]; then
+    record WARN "Sizing" "machine fits ${RUNNER_COUNT} per repository; ${problems}" fix
+  else
+    record PASS "Sizing" "${RUNNER_COUNT} runner(s) per repository fits $(memory_gb) GB, $(cpu_count) cores"
+  fi
+}
+
+# Tool locations: without them, setup-dotnet, setup-python and setup-ruby fail with "Permission denied".
+check_tool_settings() {
+  local owner missing
+  owner="$(stat -c %U "${TOOL_CACHE_DIR}" 2>/dev/null || true)"
+  if [[ ${owner} != "${RUNNER_USER}" ]]; then
+    record WARN "Tool locations" "${TOOL_CACHE_DIR} ${owner:+is owned by ${owner}}${owner:-missing}" fix
+  elif [[ ${EUID} -ne 0 ]]; then
+    record PASS "Tool locations" "${TOOL_CACHE_DIR} ready (run with sudo to check each runner's .env)"
+  elif missing="$(runners_missing_settings)" && [[ -n ${missing} ]]; then
+    record WARN "Tool locations" ".env settings missing for ${missing}" fix
+  else
+    record PASS "Tool locations" "${TOOL_CACHE_DIR} ready; every runner's .env set"
+  fi
+}
+
+# Public repositories: a self-hosted runner lets anyone's pull request run as root here (root only:
+# the repository names are in the runners' folders).
+check_public_repositories() {
+  [[ ${EUID} -eq 0 ]] || return 0
+  local full public=""
+  while read -r full; do
+    [[ -n ${full} ]] || continue
+    if [[ "$(repository_visibility "${full}")" == "public" ]]; then public="${public:+${public}, }${full}"; fi
+  done < <(repositories_with_runners)
+  if [[ -n ${public} ]]; then
+    record FAIL "Private repositories" "public, remove their runners: ${public} (sudo ghrunner delete <repo>)"
+  else
+    record PASS "Private repositories" "every repository with runners here is private"
+  fi
+}
+
+# ---------------------------------------------------------------------------------------------
+# hostctl hooks
+# ---------------------------------------------------------------------------------------------
+
+# Docker group membership is already root-equivalent, and Playwright's --with-deps installs browser
+# libraries with apt, so the runner user may sudo. That is why this VM must hold no secrets of its own.
+create_runner_user() {
+  log "Creating the ${RUNNER_USER} user"
+  if ! id "${RUNNER_USER}" >/dev/null 2>&1; then
+    adduser --disabled-password --gecos "" "${RUNNER_USER}" >/dev/null
+  fi
+  usermod -aG docker "${RUNNER_USER}"
+  local sudoers=/etc/sudoers.d/${RUNNER_USER}
+  echo "${RUNNER_USER} ALL=(ALL) NOPASSWD:ALL" >"${sudoers}.new"
+  visudo -cqf "${sudoers}.new" || die "sudoers file failed its check"
+  chmod 440 "${sudoers}.new"
+  mv "${sudoers}.new" "${sudoers}"
+}
+
+# hostctl hook "setup": creates the runner user, sizes the runners for this machine (adds, relabels and
+# removes them, for RUNNER_REPOS and every repository already here), and updates every runner's .env.
+runner_setup() {
+  local repository full
+  local -a repositories requested=()
+  create_runner_user
+  resolve_runner_settings
+  note "$(memory_gb) GB, $(cpu_count) cores: ${RUNNER_COUNT} runner(s) per repository, stack label ${STACK_LABEL}"
+  IFS=',' read -r -a repositories <<<"${RUNNER_REPOS}"
+  for repository in "${repositories[@]}"; do
+    full="$(full_repository_name "${repository}")" || exit 1
+    requested+=("${full}")
+  done
+  mapfile -t repositories < <({ printf '%s\n' "${requested[@]}"; repositories_with_runners; } | sort -fu)
+  for full in "${repositories[@]}"; do
+    resize_repository "${full}"
+  done
+  log "Runner settings (.env)"
+  configure_runners
+  note "all runners up to date"
+}
+
+# hostctl hook: the ghrunner command.
+runner_install_commands() {
+  ln -sfn "${TOOLS_DIR}/github-runner/ghrunner.sh" /usr/local/bin/ghrunner
+}
+
+# hostctl hook: what to do after setup.
+runner_notes() {
+  note "Next, in each repository: Settings > Secrets and variables > Actions > Variables."
+  note "GroundCore: CI_RUNNER=groundcore-ci; CI_STACK_RUNNER=groundcore-stack only if a runner has that label."
+  note "Runners: ghrunner status"
+}
+
+# hostctl hook: the runner's doctor checks.
+runner_checks() {
+  check_runner_services
+  check_sizing
+  check_public_repositories
+  check_tool_settings
+}
+
+# hostctl hook: before the weekly update, waits up to 3 hours until no job is running, then stops the
+# runners so none starts while Docker is upgraded. Fails (and the update is skipped) if they stay busy.
+runner_pause() {
+  log "Waiting until no job is running (up to 3 hours)"
+  wait_until_idle 180 || return 1
+  pause_runners
+  note "paused ${#PAUSED_UNITS[@]} runner(s) for the upgrade"
+}
+
+# hostctl hook: starts the runners runner_pause stopped.
+runner_resume() {
+  if ((${#PAUSED_UNITS[@]} > 0)); then
+    resume_runners
+    note "runners started again"
+  fi
+}
+
+# hostctl hook: after "hostctl update", each runner's version against the latest release (runners update
+# themselves, so this only reports).
+runner_update_report() {
+  local latest unit name version
+  log "Runner versions"
+  latest="$(latest_runner_version)"
+  {
+    printf 'RUNNER\tVERSION\tLATEST\tSTATUS\n'
+    while IFS=$'\t' read -r unit _; do
+      IFS=$'\t' read -r name _ <<<"$(unit_identity "${unit}")"
+      version="$(runner_version "${unit}")"
+      printf '%s\t%s\t%s\t%s\n' "${name}" "${version}" "${latest}" "$(version_status "${version}" "${latest}")"
+    done < <(runner_units)
+  } | print_table
+}
+
+# hostctl hook: CI leaves images, build cache and volumes behind, so the weekly clean-up takes all three.
+runner_prune_level() {
+  echo "full"
+}
+
+# hostctl hook: the runner user must never log in over SSH.
+runner_ssh_deny_users() {
+  echo "${RUNNER_USER}"
 }

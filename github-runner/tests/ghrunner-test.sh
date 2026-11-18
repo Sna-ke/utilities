@@ -205,13 +205,13 @@ denyusers runner
 port 22
 port 9452" "${SSH_SAMPLE}"
 check "ssh problems: moving ports" "WARN listening on ports 22 9452: confirm the new one so the old one closes" \
-  "$(ssh_problems <<<"${SSH_SAMPLE}")"
-check "ssh problems: none when locked down" "" "$(grep -v '^port 22$' <<<"${SSH_SAMPLE}" | ssh_problems)"
+  "$(ssh_problems runner <<<"${SSH_SAMPLE}")"
+check "ssh problems: none when locked down" "" "$(grep -v '^port 22$' <<<"${SSH_SAMPLE}" | ssh_problems runner)"
 check "ssh problems: a stock server" "FAIL password login is on
 WARN on port 22, which every scanner tries
 WARN root can log in (prohibit-password)
 WARN the runner user can log in over SSH
-WARN 6 tries per connection" "$(printf 'passwordauthentication yes\nkbdinteractiveauthentication no\npermitrootlogin prohibit-password\nmaxauthtries 6\nport 22\n' | ssh_problems)"
+WARN 6 tries per connection" "$(printf 'passwordauthentication yes\nkbdinteractiveauthentication no\npermitrootlogin prohibit-password\nmaxauthtries 6\nport 22\n' | ssh_problems runner)"
 
 UFW_SAMPLE="Status: active
 
@@ -228,8 +228,10 @@ check "firewall: SSH moved, leftovers" "also lets in 22/tcp
 also lets in OpenSSH
 also lets in 80/tcp" "$(firewall_problems 9452 <<<"${UFW_SAMPLE}")"
 check "firewall: still on 22, plain allow" "OpenSSH has no rate limit
-also lets in 80/tcp" "$(firewall_problems 22 9452 <<<"${UFW_SAMPLE}")"
+also lets in 80/tcp" "$(firewall_problems "22 9452" <<<"${UFW_SAMPLE}")"
 check "firewall: clean" "" "$(firewall_problems 9452 <<<"$(grep -vE '^(22/tcp|OpenSSH|80/tcp)' <<<"${UFW_SAMPLE}")")"
+check "firewall: a component's port is allowed" "also lets in 22/tcp
+also lets in OpenSSH" "$(firewall_problems 9452 "80/tcp" <<<"${UFW_SAMPLE}")"
 
 if ((EUID != 0)); then
   mkdir -p "${SAMPLES}/f/sshd_config.d"
@@ -408,14 +410,14 @@ unset -f install_runner remove_runner reregister_runner download_runner busy_uni
 # version and self-update
 # ---------------------------------------------------------------------------------------------
 
-mkdir -p "${SAMPLES}/installed"
-printf 'echo one\n' >"${SAMPLES}/installed/setup-runner.sh"
-printf '' >"${SAMPLES}/installed/runner-lib.sh"
-printf 'tab\there\0nul\n' >"${SAMPLES}/installed/ghrunner.sh"
+mkdir -p "${SAMPLES}/installed/github-runner" "${SAMPLES}/installed/host"
+printf 'echo one\n' >"${SAMPLES}/installed/github-runner/setup-runner.sh"
+printf '' >"${SAMPLES}/installed/github-runner/runner-lib.sh"
+printf 'tab\there\0nul\n' >"${SAMPLES}/installed/github-runner/ghrunner.sh"
 if command -v git >/dev/null; then
   for file in setup-runner.sh runner-lib.sh ghrunner.sh; do
-    check "blob hash matches git: ${file}" "$(git hash-object "${SAMPLES}/installed/${file}")" \
-      "$(git_blob_sha "${SAMPLES}/installed/${file}")"
+    check "blob hash matches git: ${file}" "$(git hash-object "${SAMPLES}/installed/github-runner/${file}")" \
+      "$(git_blob_sha "${SAMPLES}/installed/github-runner/${file}")"
   done
 fi
 COMMITS_JSON="$(jq -cn '[
@@ -428,25 +430,29 @@ check "changes since the installed commit" "ccccccc  2026-11-20  Newest change
 bbbbbbb  2026-11-18  Middle change" "$(commits_since "$(printf 'a%.0s' {1..40})" <<<"${COMMITS}")"
 check "changes since an unknown commit: newest ones" "3" "$(commits_since unknown <<<"${COMMITS}" | wc -l | tr -d ' ')"
 
-BLOBS_JSON="$(jq -cn --arg s "$(git_blob_sha "${SAMPLES}/installed/setup-runner.sh")" \
-  --arg l "$(git_blob_sha "${SAMPLES}/installed/runner-lib.sh")" --arg g "$(git_blob_sha "${SAMPLES}/installed/ghrunner.sh")" '[
+BLOBS_JSON="$(jq -cn --arg s "$(git_blob_sha "${SAMPLES}/installed/github-runner/setup-runner.sh")" \
+  --arg l "$(git_blob_sha "${SAMPLES}/installed/github-runner/runner-lib.sh")" \
+  --arg g "$(git_blob_sha "${SAMPLES}/installed/github-runner/ghrunner.sh")" '[
   {name: "README.md", type: "file", sha: "0000"}, {name: "tests", type: "dir", sha: "1111"},
   {name: "setup-runner.sh", type: "file", sha: $s}, {name: "runner-lib.sh", type: "file", sha: $l},
   {name: "ghrunner.sh", type: "file", sha: $g}]')"
-BLOBS="$(parse_blobs <<<"${BLOBS_JSON}")"
-check "file list skips folders" "4" "$(wc -l <<<"${BLOBS}" | tr -d ' ')"
+BLOBS="$(parse_blobs github-runner <<<"${BLOBS_JSON}")"
+check "file list: scripts only, with their folder" "github-runner/setup-runner.sh
+github-runner/runner-lib.sh
+github-runner/ghrunner.sh" "$(cut -f1 <<<"${BLOBS}")"
 check "installed files match" "ok" "$(outcome files_match "${SAMPLES}/installed" "${BLOBS}")"
-printf 'echo two\n' >"${SAMPLES}/installed/setup-runner.sh"
+printf 'echo two\n' >"${SAMPLES}/installed/github-runner/setup-runner.sh"
 check "a changed file doesn't match" "fails" "$(outcome files_match "${SAMPLES}/installed" "${BLOBS}")"
 check "a missing file doesn't match" "fails" "$(outcome files_match "${SAMPLES}/nowhere" "${BLOBS}")"
 check "an empty listing doesn't match" "fails" "$(outcome files_match "${SAMPLES}/installed" "")"
-check "version in runner-lib.sh" "${GHRUNNER_VERSION}" "$(version_from_text <"${TESTS_DIR}/../runner-lib.sh")"
+check "version in host-lib.sh" "${TOOLS_VERSION}" "$(version_from_text <"${TESTS_DIR}/../../host/host-lib.sh")"
+check "version of a 1.x runner-lib.sh" "1.5.0" "$(version_from_text <<<'GHRUNNER_VERSION="1.5.0"')"
 check "version: none in an old copy" "" "$(version_from_text <<<'GITHUB_OWNER="x"')"
 check "newer: 1.10.0 vs 1.9.0" "ok" "$(outcome version_newer 1.10.0 1.9.0)"
 check "newer: same version" "fails" "$(outcome version_newer 1.3.0 1.3.0)"
 check "newer: older" "fails" "$(outcome version_newer 1.2.9 1.3.0)"
 check "changelog has a line for this version" "1" \
-  "$(changelog_since 0 <"${TESTS_DIR}/../CHANGELOG.md" | grep -c "^${GHRUNNER_VERSION//./\\.}  ")"
+  "$(changelog_since 0 <"${TESTS_DIR}/../../host/CHANGELOG.md" | grep -c "^${TOOLS_VERSION//./\\.}  ")"
 CHANGELOG_SAMPLE="| Version | Date | Changes |
 | --- | --- | --- |
 | 1.10.0 | 2026-12-01 | Ten |
@@ -459,7 +465,7 @@ check "changelog since an old copy: everything" "3" \
 check "changelog since the latest: nothing" "" "$(changelog_since 1.10.0 <<<"${CHANGELOG_SAMPLE}")"
 check "describe version with commit" "1.3.0 (commit abcdef1)" "$(describe_version 1.3.0 abcdef1234567890)"
 check "describe version, commit unknown" "1.3.0" "$(describe_version 1.3.0 unknown)"
-check "installed version of an old copy" "1.2.0 or older" "$(GHRUNNER_LIB_DIR="${SAMPLES}/installed" installed_version)"
+check "installed version of an old copy" "1.2.0 or older" "$(TOOLS_DIR="${SAMPLES}/installed" installed_version)"
 check "self-update without root" "fails" "$(outcome bash "${TESTS_DIR}/../ghrunner.sh" self-update --bogus)"
 
 # ---------------------------------------------------------------------------------------------
@@ -471,9 +477,15 @@ check "visibility: private (with a token)" "private" "$(visibility_from_response
 check "visibility: hidden means private" "private" "$(visibility_from_response 404 '{"message": "Not Found"}')"
 check "visibility: rate limited" "unknown" "$(visibility_from_response 403 '{}')"
 
-# setup-runner.sh's functions (it only runs when executed, not when sourced).
-# shellcheck source=SCRIPTDIR/../setup-runner.sh
-. "${TESTS_DIR}/../setup-runner.sh"
+# setup-host.sh's functions (it only runs when executed, not when sourced).
+# shellcheck source=SCRIPTDIR/../../host/setup-host.sh
+. "${TESTS_DIR}/../../host/setup-host.sh"
+# hostctl.sh's functions too (audit_findings).
+# shellcheck source=SCRIPTDIR/../../host/hostctl.sh
+. "${TESTS_DIR}/../../host/hostctl.sh"
+trap - ERR
+COMPONENTS_FILE="${SAMPLES}/components"
+echo "github-runner" >"${COMPONENTS_FILE}"
 trap - ERR
 check "ssh port 22" "ok" "$(outcome valid_ssh_port 22)"
 check "ssh port 9452" "ok" "$(outcome valid_ssh_port 9452)"
@@ -496,7 +508,7 @@ SETTINGS="$(ssh_settings yes no 22 9452)"
 check "ssh settings: both ports while moving" $'Port 22\nPort 9452' "$(grep '^Port' <<<"${SETTINGS}")"
 check "ssh settings: keys only" $'PasswordAuthentication no\nKbdInteractiveAuthentication no' \
   "$(grep -E '^(Password|KbdInteractive)' <<<"${SETTINGS}")"
-check "ssh settings: runner can't log in" "DenyUsers runner" "$(grep '^DenyUsers' <<<"${SETTINGS}")"
+check "ssh settings: the component's service account can't log in" "DenyUsers ${RUNNER_USER}" "$(grep '^DenyUsers' <<<"${SETTINGS}")"
 check "ssh settings: no key, password stays" "" "$(ssh_settings no prohibit-password 22 | grep '^PasswordAuthentication' || true)"
 
 check "audit users" "users	root	uid=0 shell=/bin/bash
@@ -533,9 +545,9 @@ EOF
 )" || true
 check "newest kernel" "6.8.0-51-generic" "$(printf 'vmlinuz-6.8.0-9-generic\nvmlinuz-6.8.0-51-generic\nvmlinuz-6.8.0-49-generic\n' | newest_kernel)"
 
-GHRUNNER_STATE_DIR="${SAMPLES}/state"
-AUDIT_BASELINE="${GHRUNNER_STATE_DIR}/audit-baseline"
-AUDIT_STATUS="${GHRUNNER_STATE_DIR}/audit-status"
+STATE_DIR="${SAMPLES}/state"
+AUDIT_BASELINE="${STATE_DIR}/audit-baseline"
+AUDIT_STATUS="${STATE_DIR}/audit-status"
 printf 'firewall\tStatus: active\t-\nlogins\tbrian from 203.0.113.7\t-\nsudo\t/etc/sudoers\taaaa\nusers\trunner\tuid=1001 shell=/bin/bash\n' \
   >"${SAMPLES}/snapshot-1"
 audit_accept "${SAMPLES}/snapshot-1"
@@ -554,6 +566,14 @@ check "a login from a new address counts" "logins	added	mallory from 192.0.2.66"
 audit_accept "${SAMPLES}/snapshot-2"
 check "accepting keeps known logins" "1" "$(grep -c '^logins	brian from 203.0.113.7' "${AUDIT_BASELINE}")"
 
+# A host updating from 1.x: its baseline's sections for the tools' files moved (ghrunner -> tools).
+check "1.x baseline header, exactly as 1.x wrote it" "# ghrunner audit baseline, format 1" "${AUDIT_FORMAT_1}"
+printf '%s\nghrunner\t/usr/local/bin/ghrunner\taaaa\nsudo\t/etc/sudoers\tbbbb\n' "${AUDIT_FORMAT_1}" >"${SAMPLES}/baseline-1"
+printf 'ghrunner\t/usr/local/bin/ghrunner\tzzzz\nsudo\t/etc/sudoers\tbbbb\ntools\t/usr/local/bin/hostctl\tcccc\n' >"${SAMPLES}/snapshot-3"
+check "1.x baseline: the moved sections don't count" "" "$(audit_findings "${SAMPLES}/baseline-1" "${SAMPLES}/snapshot-3")"
+printf 'sudo\t/etc/sudoers.d/extra\tdddd\n' >>"${SAMPLES}/snapshot-3"
+check "1.x baseline: a real change still does" "sudo	added	/etc/sudoers.d/extra" "$(audit_findings "${SAMPLES}/baseline-1" "${SAMPLES}/snapshot-3")"
+
 ALERTS="${SAMPLES}/alerts"
 # shellcheck disable=SC2317,SC2329
 send_alert() { echo "$1" >>"${ALERTS}"; }
@@ -561,12 +581,12 @@ audit_record "$(printf 'sudo\tchanged\t/etc/sudoers')"
 check "a manual check doesn't alert" "fails" "$(outcome test -e "${ALERTS}")"
 audit_record "$(printf 'sudo\tchanged\t/etc/sudoers')" yes
 check "findings: status for doctor" "1" "$(cut -f2 "${AUDIT_STATUS}")"
-check "findings: note for the next login" "1" "$(grep -c 'nobody accepted' "${GHRUNNER_STATE_DIR}/attention/audit")"
+check "findings: note for the next login" "1" "$(grep -c 'nobody accepted' "${STATE_DIR}/attention/audit")"
 check "findings: one alert" "audit found 1 unexpected change(s)" "$(cat "${ALERTS}")"
 audit_record "$(printf 'sudo\tchanged\t/etc/sudoers')" yes
 check "same findings tomorrow: no second alert" "1" "$(wc -l <"${ALERTS}" | tr -d ' ')"
 audit_record ""
-check "all clear: login note removed" "fails" "$(outcome test -e "${GHRUNNER_STATE_DIR}/attention/audit")"
+check "all clear: login note removed" "fails" "$(outcome test -e "${STATE_DIR}/attention/audit")"
 check "all clear: status 0" "0" "$(cut -f2 "${AUDIT_STATUS}")"
 unset -f send_alert
 
