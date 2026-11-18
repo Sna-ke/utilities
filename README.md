@@ -5,7 +5,8 @@ a secret: tokens and keys are passed in when a script runs and never committed.
 
 | Folder | What it is |
 | --- | --- |
-| [`github-runner/`](github-runner/README.md) | Sets up an Ubuntu VM as a host for GitHub Actions self-hosted runners, and `ghrunner` to manage it |
+| [`host/`](host/README.md) | What every VM gets: hardening, Docker, alerts, a daily audit, a weekly update, and `hostctl`. One-line install for any component |
+| [`github-runner/`](github-runner/README.md) | Component: GitHub Actions self-hosted runners, and `ghrunner` to manage them |
 
-Every shell script passes ShellCheck (`.github/workflows/shellcheck.yml`). `ghrunner`'s tests run in
-`.github/workflows/github-runner-tests.yml`.
+Every shell script passes ShellCheck (`.github/workflows/shellcheck.yml`). The tests run in
+`.github/workflows/github-runner-tests.yml`. What changed in each version: [`host/CHANGELOG.md`](host/CHANGELOG.md).
