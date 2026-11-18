@@ -3,7 +3,8 @@
 #
 #   curl -fsSL https://raw.githubusercontent.com/Sna-ke/utilities/main/host/install.sh | sudo bash -s -- <component>...
 #
-# Components: github-runner. Several can share a host.
+# Components: github-runner, portainer-server, portainer-node. Several can share a host (not the
+# Portainer server and a node).
 #
 # 1. Finds the latest commit on main (or TOOLS_BRANCH).
 # 2. Downloads host/ and the components' folders from that commit into a temporary runner-install

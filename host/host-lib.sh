@@ -11,6 +11,8 @@
 #   install_commands  link the component's commands into /usr/local/bin
 #   checks            add rows to "hostctl doctor" (with record)
 #   pause, resume     stop and restart work around the weekly update (pause fails to skip the update)
+#   upgrade           after the packages, bring the component's own software up to date (Portainer:
+#                     the newest image of its tag)
 #   update_report     print the component's part of "hostctl update"
 #   prune_level       "full" (CI: volumes too) or "images" (production: never volumes)
 #   firewall_allowed  ports besides SSH the component opens, e.g. "9443/tcp" (doctor accepts them)
@@ -23,7 +25,7 @@
 # The version of every script in host/ and the component folders. Every pull request that changes one
 # raises it and adds a line to host/CHANGELOG.md; CI checks both (github-runner/tests/version-check.sh).
 # shellcheck disable=SC2034 # read by the scripts that source this file
-TOOLS_VERSION="2.0.0"
+TOOLS_VERSION="2.1.0"
 # Where self-update and the installer get new versions.
 TOOLS_REPO="${TOOLS_REPO:-Sna-ke/utilities}"
 TOOLS_BRANCH="${TOOLS_BRANCH:-main}"
@@ -54,6 +56,8 @@ KERNEL_SETTINGS=(
 # Components: <name>:<folder>:<library>:<hook prefix>.
 TOOLS_COMPONENTS=(
   github-runner:github-runner:runner-lib.sh:runner
+  portainer-server:portainer:portainer-lib.sh:pserver
+  portainer-node:portainer:portainer-lib.sh:pnode
 )
 # What setup and resize couldn't do, with why and how to finish; printed at the end.
 STILL_TO_DO=()
@@ -146,6 +150,15 @@ register_components() {
   mv "${COMPONENTS_FILE}.new" "${COMPONENTS_FILE}"
 }
 
+# Removes components from the installed list (their own remove command has undone their setup).
+unregister_components() {
+  local component
+  [[ -f ${COMPONENTS_FILE} ]] || return 0
+  installed_components | grep -vxF -f <(printf '%s\n' "$@") >"${COMPONENTS_FILE}.new" || true
+  mv "${COMPONENTS_FILE}.new" "${COMPONENTS_FILE}"
+  for component in "$@"; do note "${component} removed from hostctl's components"; done
+}
+
 # Prints the folders a set of components needs: host first, then each component's folder, once.
 tool_folders() {
   local component
@@ -155,13 +168,18 @@ tool_folders() {
   } | awk '!seen[$0]++'
 }
 
-# Sources the libraries of the installed components from <root> (a checkout, a download or TOOLS_DIR).
+# Sources the libraries of the installed components from <root> (a checkout, a download or TOOLS_DIR),
+# each library once (the Portainer server and node share one).
 load_components() {
-  local root="$1" component
+  local root="$1" component library
+  local -A loaded=()
   while read -r component; do
     [[ -n ${component} ]] || continue
+    library="${root}/$(component_field "${component}" folder)/$(component_field "${component}" library)"
+    [[ -z ${loaded[${library}]+set} ]] || continue
+    loaded["${library}"]=1
     # shellcheck source=/dev/null # the component libraries are checked on their own
-    . "${root}/$(component_field "${component}" folder)/$(component_field "${component}" library)"
+    . "${library}"
   done < <(installed_components)
 }
 
@@ -606,7 +624,7 @@ audit_setuid() {
 # hostctl's own files and command links, by hash: only setup should change them.
 audit_tools() {
   local file
-  for file in /usr/local/bin/hostctl /usr/local/bin/ghrunner "${TOOLS_DIR}"/*/*.sh; do
+  for file in /usr/local/bin/hostctl /usr/local/bin/ghrunner /usr/local/bin/portainerctl "${TOOLS_DIR}"/*/*.sh; do
     if [[ -f ${file} ]]; then printf 'tools\t%s\t%s\n' "${file}" "$(git_blob_sha "${file}" | cut -c1-16)"; fi
   done
 }

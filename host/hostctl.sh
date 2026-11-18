@@ -97,8 +97,8 @@ audit() {
 # ---------------------------------------------------------------------------------------------
 
 # hostctl update [--scheduled]: upgrades every package (Docker's too), never reboots, and warns when a
-# new kernel waits for a reboot; then each component reports (the runner: versions against the latest
-# release). --scheduled (the weekly timer) first lets each component pause its work (the runner waits
+# new kernel waits for a reboot; then each component upgrades its own software (Portainer: the newest
+# image of its tag) and reports (the runner: versions against the latest release). --scheduled (the weekly timer) first lets each component pause its work (the runner waits
 # until no job is running), and alerts instead of printing.
 update() {
   require_root
@@ -131,6 +131,8 @@ update() {
   else
     clear_attention reboot
   fi
+  # A failure stops here, so the timer's service shows as failed and doctor reports it.
+  call_hooks upgrade
   call_hooks update_report
 }
 
@@ -327,7 +329,7 @@ Commands                What it does                                            
   self-update [--yes]   update from main, after showing what changed                       yes
   help                  this text                                                          no
 
-Components add their own command: ghrunner (GitHub runners).
+Components add their own command: ghrunner (GitHub runners), portainerctl (Portainer).
 EOF
 }
 
