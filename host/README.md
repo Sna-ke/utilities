@@ -6,6 +6,8 @@ weekly update, and `hostctl` to look after it all. Components add what the VM is
 | Component | Folder | What it adds |
 | --- | --- | --- |
 | `github-runner` | [`github-runner/`](../github-runner/README.md) | GitHub Actions self-hosted runners, and `ghrunner` |
+| `portainer-server` | [`portainer/`](../portainer/README.md) | The Portainer control plane (web UI), and `portainerctl` |
+| `portainer-node` | [`portainer/`](../portainer/README.md) | A Docker host Portainer manages through its agent, and `portainerctl` |
 
 | File | What it is |
 | --- | --- |
@@ -31,7 +33,8 @@ curl -fsSL https://raw.githubusercontent.com/Sna-ke/utilities/main/host/install.
 | Pushover user key | From pushover.net once you log in, or Enter for no alerts |
 | Pushover application token | Create an application at pushover.net/apps/build (any name). Setup checks both with Pushover and sends a test alert |
 
-Several components can share a host: run the line again with another component, or name several at once. To try a
+Several components can share a host: run the line again with another component, or name several at once (but a VM is
+either the Portainer server or a node, not both). To try a
 branch before merging it: `curl -fsSL https://raw.githubusercontent.com/Sna-ke/utilities/<branch>/host/install.sh | sudo TOOLS_BRANCH=<branch> bash -s -- <component>`.
 
 ## What setup does
@@ -57,7 +60,7 @@ branch before merging it: `curl -fsSL https://raw.githubusercontent.com/Sna-ke/u
 | --- | --- | --- |
 | `hostctl doctor [--fix]` | Checks the host and its components. Prints PASS/WARN/FAIL and exits 1 on any FAIL. `--fix` runs the installed setup again when a problem is one it fixes, then checks again | No (`--fix`: yes) |
 | `hostctl audit [--accept]` | Lists what changed since the audit baseline (see Security). `--accept` makes the current state the baseline, after you've checked the changes are yours | Yes |
-| `hostctl update [--scheduled]` | Upgrades every package (Docker's too), never reboots, and warns when a new kernel waits for one; then each component reports. `--scheduled` is the weekly timer: components pause their work first | Yes |
+| `hostctl update [--scheduled]` | Upgrades every package (Docker's too), never reboots, and warns when a new kernel waits for one; then each component upgrades its own software (Portainer: the newest image of its tag) and reports. `--scheduled` is the weekly timer: components pause their work first | Yes |
 | `hostctl prune` | Runs the weekly clean-up now and shows the space freed | Yes |
 | `hostctl version` | The installed version and commit, the components, the latest on `main`, and whether they match | No |
 | `hostctl self-update [--yes]` | Updates to the latest `main`, after listing what changed (see Updating) | Yes |
@@ -94,7 +97,7 @@ Without sudo, the firewall rules and the alert settings aren't checked.
 | Firewall | ufw allows only the SSH port, and blocks an address after 6 connection attempts in 30 seconds. Docker publishes ports on 127.0.0.1 only, because its rules bypass ufw |
 | Updates | Ubuntu's security updates daily. A full update (Docker included) weekly, Sunday 11:00 UTC (`UPDATE_SCHEDULE`): components pause their work first (the runner waits until no job runs), and Docker's live-restore keeps containers running while it restarts. It never reboots: a waiting kernel shows at login, in `doctor`, and as an alert |
 | Audit | Setup records a baseline: accounts, SSH keys, sudo rules, SSH settings, firewall rules, ports open to the outside, cron jobs, services that start at boot, setuid programs, hostctl's own files, and where SSH logins come from. A timer compares the machine with it daily |
-| Hearing about it | Audit findings and a waiting kernel show at every SSH login and in `hostctl doctor`, and go to Pushover if you set it up (once per new set of findings, not daily). Audit alerts are high priority, so they sound even in quiet hours. The key and token are kept in `/etc/ghrunner/pushover`, readable by root only |
+| Hearing about it | Audit findings and a waiting kernel show at every SSH login and in `hostctl doctor`, and go to Pushover if you set it up (once per new set of findings, not daily). Audit alerts are high priority, so they sound even in quiet hours. The key and token are kept in `/etc/hostctl/pushover`, readable by root only |
 | Updates can't bless a compromise | Setup, and so `self-update`, checks the audit first and stops if anything changed that nobody accepted |
 
 **Limits.** Someone with root on the VM can hide from the audit; it catches mistakes and careless intruders, not a
@@ -154,6 +157,7 @@ is at the top of `host-lib.sh`), an entry in `TOOLS_COMPONENTS`, and a row in th
 | --- | --- |
 | ShellCheck on every script | CI (`.github/workflows/shellcheck.yml`) |
 | Parsing and decisions: SSH settings, firewall rules, audit, alerts, versions, plus the runner's (see its README) | CI (`.github/workflows/github-runner-tests.yml`), or `bash github-runner/tests/ghrunner-test.sh` |
+| Portainer's parsing and decisions (see its README) | CI (`.github/workflows/portainer-tests.yml`), or `bash portainer/tests/portainer-test.sh` |
 
 Only a real VM can test systemd, journald, Docker, apt, ufw, sshd and cron as they behave on Ubuntu 24.04, moving
 the SSH port, Pushover, and the installer, `self-update` and `doctor --fix` running setup end to end.

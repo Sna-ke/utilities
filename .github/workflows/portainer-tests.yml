@@ -1,0 +1,19 @@
+# Runs portainerctl's parsing tests against sample input; no VM, Docker or Portainer needed. This
+# repository is public, so GitHub-hosted runners cost nothing.
+name: portainer tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: portainerctl parsing tests (jq is preinstalled on GitHub's Ubuntu runners)
+        run: bash portainer/tests/portainer-test.sh
