@@ -314,6 +314,7 @@ check "login body keeps quotes and backslashes in the password" '{"Username":"ad
 
 # The one-line installer must stage libraries for existing components as well as new ones. Otherwise
 # adding the Portainer server to a runner VM fails when setup-host.sh loads runner-lib.sh.
+# shellcheck disable=SC2329 # called indirectly by components_for_setup
 legacy_runner_present() { return 1; } # make tests independent of this machine's directories
 mkdir -p "${CONFIG_DIR}"
 : >"${COMPONENTS_FILE}"
@@ -326,6 +327,7 @@ check "install: all folders for runner and Portainer" $'host\nportainer\ngithub-
 printf 'github-runner\nportainer-server\n' >"${COMPONENTS_FILE}"
 check "install: retry after interrupted setup deduplicates server" $'portainer-server\ngithub-runner' \
   "$(components_for_setup portainer-server)"
+# shellcheck disable=SC2329 # called indirectly by components_for_setup
 legacy_runner_present() { return 0; }
 : >"${COMPONENTS_FILE}"
 check "install: 1.x runner migration also stages its library" $'portainer-server\ngithub-runner' \
