@@ -25,7 +25,7 @@
 # The version of every script in host/ and the component folders. Every pull request that changes one
 # raises it and adds a line to host/CHANGELOG.md; CI checks both (github-runner/tests/version-check.sh).
 # shellcheck disable=SC2034 # read by the scripts that source this file
-TOOLS_VERSION="2.1.0"
+TOOLS_VERSION="2.1.1"
 # Where self-update and the installer get new versions.
 TOOLS_REPO="${TOOLS_REPO:-Sna-ke/utilities}"
 TOOLS_BRANCH="${TOOLS_BRANCH:-main}"
@@ -166,6 +166,22 @@ tool_folders() {
     echo "host"
     for component in "$@"; do component_field "${component}" folder; done
   } | awk '!seen[$0]++'
+}
+
+# True when setup-host.sh will migrate a pre-2.0.0 runner installation.
+legacy_runner_present() {
+  [[ -d /var/lib/ghrunner || -d /etc/ghrunner ]]
+}
+
+# Components setup-host.sh will load: newly requested ones, already registered ones, and any runner
+# found in the old 1.x layout. Include them all in a one-line install's verified download; otherwise
+# load_components and install_tools fail when adding Portainer to an existing runner VM.
+components_for_setup() {
+  {
+    printf '%s\n' "$@"
+    installed_components
+    if legacy_runner_present; then echo github-runner; fi
+  } | awk 'NF && !seen[$0]++'
 }
 
 # Sources the libraries of the installed components from <root> (a checkout, a download or TOOLS_DIR),
