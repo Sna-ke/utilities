@@ -7,8 +7,8 @@
 # Portainer server and a node).
 #
 # 1. Finds the latest commit on main (or TOOLS_BRANCH).
-# 2. Downloads host/ and the components' folders from that commit into a temporary runner-install
-#    folder, and checks every script against the hash GitHub reports for it.
+# 2. Downloads host/ plus folders for the requested, registered and legacy runner components from
+#    that commit, checking every script against the hash GitHub reports for it.
 # 3. For the GitHub runner, asks for a GitHub token (hidden, kept in memory only; Enter to paste one per
 #    runner instead).
 # 4. Runs host/setup-host.sh, which hardens the host, asks for the SSH port and Pushover, and sets up
@@ -78,7 +78,7 @@ ask_token() {
 # Downloads, checks, asks for the token, runs setup-host.sh, and cleans up.
 main() {
   local commit folder token="" blobs component
-  local -a folders
+  local -a folders components
   [[ ${EUID} -eq 0 ]] || fail "run it with sudo: curl -fsSL <this file's URL> | sudo bash -s -- <component>"
   (($# > 0)) || fail "say which component to install, e.g.: curl ... | sudo bash -s -- github-runner"
   ensure_tools
@@ -94,7 +94,11 @@ main() {
   # shellcheck source=SCRIPTDIR/host-lib.sh
   . ./host/host-lib.sh
   for component in "$@"; do component_field "${component}" folder >/dev/null || die "unknown component '${component}'"; done
-  mapfile -t folders < <(tool_folders "$@")
+  mapfile -t components < <(components_for_setup "$@")
+  for component in "${components[@]}"; do
+    component_field "${component}" folder >/dev/null || die "unknown registered component '${component}'"
+  done
+  mapfile -t folders < <(tool_folders "${components[@]}")
   blobs="$(blobs_at "${commit}" "${folders[@]}")" || die "couldn't list the files at ${commit}"
   download_version "${commit}" "${folder}" "${blobs}"
   log "hostctl $(version_from_text <host/host-lib.sh) (commit ${commit:0:7}), downloaded and checked: ${folders[*]}"
