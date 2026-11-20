@@ -34,7 +34,9 @@ curl -fsSL https://raw.githubusercontent.com/Sna-ke/utilities/main/host/install.
 | Pushover application token | Create an application at pushover.net/apps/build (any name). Setup checks both with Pushover and sends a test alert |
 
 Several components can share a host: run the line again with another component, or name several at once (but a VM is
-either the Portainer server or a node, not both). To try a
+either the Portainer server or a node, not both). The installer downloads and checks the scripts for
+**all registered components** as well as the new one, so an interrupted attempt can be retried without
+losing existing runner settings. To try a
 branch before merging it: `curl -fsSL https://raw.githubusercontent.com/Sna-ke/utilities/<branch>/host/install.sh | sudo TOOLS_BRANCH=<branch> bash -s -- <component>`.
 
 ## What setup does

@@ -312,6 +312,28 @@ check "login body keeps quotes and backslashes in the password" '{"Username":"ad
 # Components in host-lib.sh
 # ---------------------------------------------------------------------------------------------
 
+# The one-line installer must stage libraries for existing components as well as new ones. Otherwise
+# adding the Portainer server to a runner VM fails when setup-host.sh loads runner-lib.sh.
+# shellcheck disable=SC2329 # called indirectly by components_for_setup
+legacy_runner_present() { return 1; } # make tests independent of this machine's directories
+mkdir -p "${CONFIG_DIR}"
+: >"${COMPONENTS_FILE}"
+check "install: new server on fresh host" "portainer-server" "$(components_for_setup portainer-server)"
+printf 'github-runner\n' >"${COMPONENTS_FILE}"
+check "install: add server alongside registered runner" $'portainer-server\ngithub-runner' \
+  "$(components_for_setup portainer-server)"
+check "install: all folders for runner and Portainer" $'host\nportainer\ngithub-runner' \
+  "$(tool_folders portainer-server github-runner)"
+printf 'github-runner\nportainer-server\n' >"${COMPONENTS_FILE}"
+check "install: retry after interrupted setup deduplicates server" $'portainer-server\ngithub-runner' \
+  "$(components_for_setup portainer-server)"
+# shellcheck disable=SC2329 # called indirectly by components_for_setup
+legacy_runner_present() { return 0; }
+: >"${COMPONENTS_FILE}"
+check "install: 1.x runner migration also stages its library" $'portainer-server\ngithub-runner' \
+  "$(components_for_setup portainer-server)"
+unset -f legacy_runner_present
+
 check "component fields" "portainer	portainer-lib.sh	pserver	pnode" \
   "$(printf '%s\t' "$(component_field portainer-server folder)" "$(component_field portainer-server library)" \
     "$(component_field portainer-server prefix)" "$(component_field portainer-node prefix)" | sed 's/\t$//')"
