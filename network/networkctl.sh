@@ -18,6 +18,16 @@ networkctl add-peer <name> <ip> <key>     register a node or administrator on th
 networkctl remove-peer <name>            revoke an existing peer
 HELP
 }
+audited_network_change() {
+  # Peer mutations are legitimate changes to the host's WireGuard audit baseline.
+  if [[ -f ${STATE_DIR}/audit-baseline ]] &&
+    ! bash "${NET_DIR}/../host/hostctl.sh" audit --before-setup >/dev/null; then
+    die "host audit detected unaccepted changes; run sudo hostctl audit"
+  fi
+  "$@"
+  bash "${NET_DIR}/../host/hostctl.sh" audit --accept >/dev/null
+}
+
 main() {
   local command="${1:-help}"
   if (($#)); then shift; fi
@@ -32,11 +42,11 @@ main() {
       ;;
     add-peer)
       [[ ${EUID} -eq 0 ]] || die "run with sudo"
-      wg_add_peer "$@"
+      audited_network_change wg_add_peer "$@"
       ;;
     remove-peer)
       [[ ${EUID} -eq 0 ]] || die "run with sudo"
-      wg_remove_peer "$@"
+      audited_network_change wg_remove_peer "$@"
       ;;
     *) die "unknown command: ${command}" ;;
   esac
