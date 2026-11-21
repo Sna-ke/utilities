@@ -332,7 +332,94 @@ mkdir -p "${CONFIG_DIR}"
 printf 'github-runner\nportainer-server\n' >"${COMPONENTS_FILE}"
 runner_prune_level() { echo full; } # runner-lib.sh isn't loaded here
 check "prune levels with the runner" $'full\nimages' "$(call_hooks prune_level)"
-check "ports the components open" 
+check "ports the components open" "9443/tcp"check "role from the components" "server" "$(this_role)"
+printf 'portainer-node\n' >"${COMPONENTS_FILE}"
+check "node: prune images only" "images" "$(call_hooks prune_level)"
+check "node: agent port" "9001/tcp" "$(call_hooks firewall_allowed)"
+check "role: node" "node" "$(this_role)"
+printf 'portainer-node\nportainer-server\n' >"${COMPONENTS_FILE}"
+check "server and node on one VM are refused" "fails" "$(outcome refuse_both_roles portainer-server)"
+check "the refused one is taken off the list" "portainer-node" "$(cat "${COMPONENTS_FILE}")"
+printf 'github-runner\nportainer-server\n' >"${COMPONENTS_FILE}"
+unregister_components portainer-server >/dev/null
+check "unregister keeps the others" "github-runner" "$(cat "${COMPONENTS_FILE}")"
+unregister_components github-runner >/dev/null
+check "unregister the last one" "" "$(cat "${COMPONENTS_FILE}")"
+
+# The shared library is sourced once even with two components using it (a fake root with a library that
+# counts its loads).
+FAKE_ROOT="${SAMPLES}/root"
+mkdir -p "${FAKE_ROOT}/portainer"
+# shellcheck disable=SC2016 # written for the library to run
+echo 'LOADS=$((LOADS + 1))' >"${FAKE_ROOT}/portainer/portainer-lib.sh"
+LOADS=0
+printf 'portainer-server\nportainer-node\n' >"${COMPONENTS_FILE}"
+load_components "${FAKE_ROOT}"
+check "shared library loaded once" "1" "${LOADS}"
+
+# Without the component list (not root), the role comes from the role file.
+chmod 000 "${COMPONENTS_FILE}"
+if [[ ${EUID} -ne 0 ]]; then
+  mkdir -p "${STATE_DIR}"
+  echo node >"${PORTAINER_ROLE_FILE}"
+  check "role without sudo" "node" "$(this_role)"
+fi
+chmod 600 "${COMPONENTS_FILE}"
+
+# shellcheck disable=SC2016 # the inner script expands its own variables
+check "usage lists every command" "ok" "$(outcome bash -c '
+  for command in add-node remove-node nodes allow-ip secret backup restore init-admin set-server set-secret status upgrade remove; do
+    grep -q "^  ${command}" <<<"$1" || exit 1
+  done' _ "$(usage)")"
+check "unknown command" "fails" "$(outcome main frobnicate)"
+
+printf '%d passed, %d failed\n' "${PASSED}" "${FAILED}"
+((FAILED == 0))
+9443/tcp\n51820/udp' "$(call_hooks firewall_allowed)"
+check "role from the components" "server" "$(this_role)"
+printf 'portainer-node\n' >"${COMPONENTS_FILE}"
+check "node: prune images only" "images" "$(call_hooks prune_level)"
+check "node: agent port" "9001/tcp" "$(call_hooks firewall_allowed)"
+check "role: node" "node" "$(this_role)"
+printf 'portainer-node\nportainer-server\n' >"${COMPONENTS_FILE}"
+check "server and node on one VM are refused" "fails" "$(outcome refuse_both_roles portainer-server)"
+check "the refused one is taken off the list" "portainer-node" "$(cat "${COMPONENTS_FILE}")"
+printf 'github-runner\nportainer-server\n' >"${COMPONENTS_FILE}"
+unregister_components portainer-server >/dev/null
+check "unregister keeps the others" "github-runner" "$(cat "${COMPONENTS_FILE}")"
+unregister_components github-runner >/dev/null
+check "unregister the last one" "" "$(cat "${COMPONENTS_FILE}")"
+
+# The shared library is sourced once even with two components using it (a fake root with a library that
+# counts its loads).
+FAKE_ROOT="${SAMPLES}/root"
+mkdir -p "${FAKE_ROOT}/portainer"
+# shellcheck disable=SC2016 # written for the library to run
+echo 'LOADS=$((LOADS + 1))' >"${FAKE_ROOT}/portainer/portainer-lib.sh"
+LOADS=0
+printf 'portainer-server\nportainer-node\n' >"${COMPONENTS_FILE}"
+load_components "${FAKE_ROOT}"
+check "shared library loaded once" "1" "${LOADS}"
+
+# Without the component list (not root), the role comes from the role file.
+chmod 000 "${COMPONENTS_FILE}"
+if [[ ${EUID} -ne 0 ]]; then
+  mkdir -p "${STATE_DIR}"
+  echo node >"${PORTAINER_ROLE_FILE}"
+  check "role without sudo" "node" "$(this_role)"
+fi
+chmod 600 "${COMPONENTS_FILE}"
+
+# shellcheck disable=SC2016 # the inner script expands its own variables
+check "usage lists every command" "ok" "$(outcome bash -c '
+  for command in add-node remove-node nodes allow-ip secret backup restore init-admin set-server set-secret status upgrade remove; do
+    grep -q "^  ${command}" <<<"$1" || exit 1
+  done' _ "$(usage)")"
+check "unknown command" "fails" "$(outcome main frobnicate)"
+
+printf '%d passed, %d failed\n' "${PASSED}" "${FAILED}"
+((FAILED == 0))
+\n'"51820/udp" "$(call_hooks firewall_allowed)"
 check "role from the components" "server" "$(this_role)"
 printf 'portainer-node\n' >"${COMPONENTS_FILE}"
 check "node: prune images only" "images" "$(call_hooks prune_level)"
