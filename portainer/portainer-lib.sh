@@ -17,7 +17,11 @@
 # one-time setup token live in a root-only env file, passed to the containers with --env-file so they
 # never appear on a command line. The admin password is asked for each time and never stored.
 
-# Settings (root only): PRIVATE_IP, PRIVATE_PREFIX, ALLOWED_IPS (server), SERVER_IP (node).
+# Settings (root only): ALLOWED_IPS (server), SERVER_IP (node).
+# WireGuard is a reusable network module and owns private addressing and key material.
+# shellcheck disable=SC1091 # component is downloaded with network/ during setup
+# shellcheck source=../network/wireguard-lib.sh
+. "$(dirname "${BASH_SOURCE[0]}")/../network/wireguard-lib.sh"
 PORTAINER_CONFIG="${CONFIG_DIR}/portainer.conf"
 # Secrets passed to the container (root only): AGENT_SECRET, and on the server PORTAINER_SETUP_TOKEN.
 PORTAINER_ENV="${CONFIG_DIR}/portainer.env"
@@ -39,8 +43,8 @@ PORTAINER_API="https://127.0.0.1:${PORTAINER_UI_PORT}/api"
 PORTAINER_ADMIN="${PORTAINER_ADMIN:-admin}"
 # Portainer's own minimum (its default password rule) and ours.
 PORTAINER_PASSWORD_MIN=12
-# Where setup puts the private address when the interface has none (netplan).
-PORTAINER_NETPLAN="/etc/netplan/60-hostctl-private.yaml"
+# Portainer management traffic must never be reachable from a public NIC.
+WG_ADMIN_ADDRESS="${WG_ADMIN_ADDRESS:-10.70.0.10}"
 # Which one this VM is ("server" or "node"), readable by everyone so status works without sudo.
 PORTAINER_ROLE_FILE="${STATE_DIR}/portainer-role"
 PORTAINER_JWT=""
@@ -179,77 +183,18 @@ public_address() {
 }
 
 # ---------------------------------------------------------------------------------------------
-# The private network (OVH vRack)
+# Private management network: provided by network/wireguard-lib.sh, not OVH vRack
 # ---------------------------------------------------------------------------------------------
 
-# From "ip -o -4 addr show" on stdin, prints the interface holding <address>, or nothing.
-interface_with_address() {
-  awk -v address="$1" '{ split($4, part, "/"); if (part[1] == address) { print $2; exit } }'
-}
-
-# From "ip -o link show" (first argument) and "ip -o -4 addr show" (second), prints the network cards
-# with no IPv4 address: where a new vRack card is. Docker's, loopback and tunnels are left out.
-unaddressed_interfaces() {
-  ADDRESSES="$2" awk '
-    BEGIN { n = split(ENVIRON["ADDRESSES"], line, "\n"); for (i = 1; i <= n; i++) { split(line[i], f, " "); if (f[2] != "") has[f[2]] = 1 } }
-    {
-      name = $2; sub(/:$/, "", name); sub(/@.*/, "", name)
-      if (name ~ /^(lo|docker|br-|veth|virbr|tun|tap|wg)/) next
-      if (!(name in has)) print name
-    }' <<<"$1"
-}
-
-# Prints the netplan file that gives <interface> the address <cidr>.
-netplan_private() {
-  printf '# Written by hostctl (Portainer): this VM'"'"'s private (vRack) address.\n'
-  printf 'network:\n  version: 2\n  ethernets:\n    %s:\n      dhcp4: false\n      addresses: [%s]\n' "$1" "$2"
-}
-
-# Makes sure this VM has its private address: asks for it (Enter keeps the current one), and when no
-# card has it yet, gives it to the card without an address (asking which, if there are several).
 ensure_private_ip() {
-  local cidr address interface current
-  local -a candidates
-  current="$(config_get PRIVATE_IP)"
-  [[ -z ${current} ]] || current="${current}/$(config_get PRIVATE_PREFIX)"
-  log "Private network (vRack)"
-  cidr="${PORTAINER_PRIVATE_IP:-}"
-  if [[ -z ${cidr} ]]; then
-    has_terminal || [[ -n ${current} ]] ||
-      die "no terminal to ask this VM's private address on: set PORTAINER_PRIVATE_IP, e.g. 10.0.0.1/24"
-    cidr="$(ask_value "This VM's private (vRack) address with its prefix, e.g. 10.0.0.1/24" "${current}" valid_private_cidr)"
+  # Refuse an in-place replacement of the old OVH vRack NIC configuration: it may
+  # still be carrying management traffic and needs a coordinated migration.
+  if [[ -f /etc/netplan/60-hostctl-private.yaml ]]; then
+    die "legacy vRack netplan configuration detected; migrate the existing Portainer host separately (network/README.md)"
   fi
-  valid_private_cidr "${cidr}" || die "'${cidr}' isn't a private address with a prefix, e.g. 10.0.0.1/24"
-  address="${cidr%/*}"
-  config_set PRIVATE_IP "${address}"
-  config_set PRIVATE_PREFIX "${cidr##*/}"
-
-  interface="$(ip -o -4 addr show | interface_with_address "${address}")"
-  if [[ -n ${interface} ]]; then
-    note "${address} is on ${interface}"
-    return
-  fi
-  mapfile -t candidates < <(unaddressed_interfaces "$(ip -o link show)" "$(ip -o -4 addr show)")
-  if ((${#candidates[@]} == 0)); then
-    STILL_TO_DO+=("No network card has ${address}, and none is free to take it. Attach this VM to the vRack in \
-OVH's control panel, then run 'sudo hostctl doctor --fix'.")
-    note "no free network card for ${address}: is this VM in the vRack?"
-    return
-  fi
-  interface="${candidates[0]}"
-  if ((${#candidates[@]} > 1)); then
-    has_terminal || die "several cards could take ${address} (${candidates[*]}): run setup in a terminal"
-    interface="$(ask_value "Which card is the vRack one (${candidates[*]})" "" valid_candidate)"
-  fi
-  netplan_private "${interface}" "${cidr}" >"${PORTAINER_NETPLAN}"
-  chmod 0600 "${PORTAINER_NETPLAN}"
-  netplan apply
-  note "${cidr} on ${interface} (${PORTAINER_NETPLAN})"
-}
-
-# For ensure_private_ip's question: true when the answer is one of the free cards.
-valid_candidate() {
-  [[ " ${candidates[*]} " == *" $1 "* ]]
+  if [[ "${1:-}" == server ]]; then wg_init_server; else wg_init_node; fi
+  wg_available || die "WireGuard tunnel is not ready; refusing to start Portainer"
+  config_set PRIVATE_IP "$(wg_private_ip)"
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -629,23 +574,23 @@ refuse_both_roles() {
 
 # Doctor row: this VM has its private address.
 check_private_network() {
-  local address interface
+  local address
   address="$(config_get PRIVATE_IP)"
   if [[ -z ${address} ]]; then
     record FAIL "Private network" "no private address set" fix
     return
   fi
-  interface="$(ip -o -4 addr show | interface_with_address "${address}")"
-  if [[ -n ${interface} ]]; then
-    record PASS "Private network" "${address} on ${interface}"
+  if wg_available "${address}"; then
+    record PASS "Private network" "${address} on wg0"
   else
-    record FAIL "Private network" "no card has ${address}: is this VM in the vRack?" fix
+    record FAIL "Private network" "WireGuard tunnel unavailable" fix
   fi
 }
 
 # Links portainerctl into /usr/local/bin.
 link_portainerctl() {
   ln -sfn "${TOOLS_DIR}/portainer/portainerctl.sh" /usr/local/bin/portainerctl
+  ln -sfn "${TOOLS_DIR}/network/networkctl.sh" /usr/local/bin/networkctl
 }
 
 # Records this VM's role (<role>) where portainerctl status can read it without sudo.
@@ -664,18 +609,21 @@ record_role() {
 configure_ui_access() {
   local allowed default
   default="$(config_get ALLOWED_IPS)"
-  [[ -n ${default} ]] || default="$(session_address)"
+  [[ -n ${default} ]] || default="${WG_ADMIN_ADDRESS}"
   allowed="${PORTAINER_HOME_IP:-}"
   if [[ -z ${allowed} ]]; then
-    allowed="$(ask_value "Addresses that may open Portainer's web UI (your home IP; space-separated)" \
+    allowed="$(ask_value "WireGuard administrator IPs allowed to open Portainer (space-separated)" \
       "${default}" valid_source_list)" ||
       die "no terminal to ask who may reach the UI on: set PORTAINER_HOME_IP, e.g. 203.0.113.7"
   fi
   valid_source_list "${allowed}" || die "'${allowed}' isn't a list of IP addresses"
   config_set ALLOWED_IPS "${allowed}"
+  # Restrict the Portainer UI to administrator peers on the authenticated VPN only.
   # shellcheck disable=SC2086 # one rule per address
-  set_port_sources "${PORTAINER_UI_PORT}" "Portainer UI" ${allowed}
-  note "the web UI lets in: ${allowed}"
+  wg_set_port_sources "${PORTAINER_UI_PORT}" "Portainer UI" ${allowed}
+  wg_check_port_sources "${PORTAINER_UI_PORT}" "Portainer UI" "${allowed}"
+  [[ ${DOCTOR_FAILED:-0} == 0 ]] || die "Portainer UI firewall isolation check failed"
+  note "the web UI lets in over wg0: ${allowed}"
 }
 
 # Makes the secrets the server needs, once: the agent secret and the setup token.
@@ -712,7 +660,7 @@ ui_fingerprint() {
 pserver_setup() {
   refuse_both_roles portainer-server
   record_role server
-  ensure_private_ip
+  ensure_private_ip server
   log "Portainer server"
   install -d -m 0700 "${PORTAINER_DATA}"
   if [[ -n ${PORTAINER_RESTORE:-} ]]; then
@@ -737,9 +685,9 @@ pserver_install_commands() { link_portainerctl; }
 pserver_notes() {
   local fingerprint
   fingerprint="$(ui_fingerprint)"
-  note "Portainer: https://$(public_address):${PORTAINER_UI_PORT} (from $(config_get ALLOWED_IPS))"
+  note "Portainer: https://$(wg_private_ip):${PORTAINER_UI_PORT} (WireGuard administrators: $(config_get ALLOWED_IPS))"
   [[ -z ${fingerprint} ]] || note "Its certificate is self-signed; check the browser shows SHA-256 ${fingerprint}"
-  note "Add a node: install portainer-node on it (it asks for this VM's private address, $(config_get PRIVATE_IP),"
+  note "Add a node: follow network/README.md (enroll its WireGuard public key first),"
   note "and the agent secret: sudo portainerctl secret), then here: sudo portainerctl add-node <name> <node's private IP>"
   note "Back up before changes: sudo portainerctl backup. Home IP changed? sudo portainerctl allow-ip <ip>"
 }
@@ -752,8 +700,9 @@ pserver_checks() {
   fi
   local exposed backup
   check_private_network
+  wg_check
   check_container server
-  check_port_sources "${PORTAINER_UI_PORT}" "Portainer UI access" "$(config_get ALLOWED_IPS)"
+  wg_check_port_sources "${PORTAINER_UI_PORT}" "Portainer UI access" "$(config_get ALLOWED_IPS)"
   exposed="$(ss -Htlnp 2>/dev/null | exposed_closed_ports | paste -sd' ' -)"
   if [[ -n ${exposed} ]]; then
     record FAIL "Portainer HTTPS only" "Portainer listens on ${exposed} on the network" fix
@@ -784,7 +733,9 @@ pserver_upgrade() {
 
 # hostctl hooks: production data never gets pruned; the UI port is Portainer's.
 pserver_prune_level() { echo "images"; }
-pserver_firewall_allowed() { echo "${PORTAINER_UI_PORT}/tcp"; }
+pserver_firewall_allowed() {
+  printf '%s\n' "${PORTAINER_UI_PORT}/tcp" "${WG_PORT}/udp"
+}
 
 # ---------------------------------------------------------------------------------------------
 # portainer-node hooks
@@ -793,14 +744,16 @@ pserver_firewall_allowed() { echo "${PORTAINER_UI_PORT}/tcp"; }
 # Asks for the server's private address (Enter keeps the current one) and lets only it reach the agent.
 configure_agent_access() {
   local server
-  server="${PORTAINER_SERVER_IP:-}"
+  server="${PORTAINER_SERVER_IP:-${WG_SERVER_ADDRESS}}"
   if [[ -z ${server} ]]; then
     server="$(ask_value "The Portainer server's private (vRack) address" "$(config_get SERVER_IP)" valid_ipv4)" ||
       die "no terminal to ask the server's address on: set PORTAINER_SERVER_IP, e.g. 10.0.0.1"
   fi
   valid_ipv4 "${server}" || die "'${server}' isn't an IPv4 address"
   config_set SERVER_IP "${server}"
-  set_port_sources "${PORTAINER_AGENT_PORT}" "Portainer agent" "${server}"
+  wg_set_port_sources "${PORTAINER_AGENT_PORT}" "Portainer agent" "${server}"
+  wg_check_port_sources "${PORTAINER_AGENT_PORT}" "Portainer agent" "${server}"
+  [[ ${DOCTOR_FAILED:-0} == 0 ]] || die "Portainer agent firewall isolation check failed"
   note "the agent lets in only ${server}"
 }
 
@@ -831,7 +784,7 @@ configure_agent_secret() {
 pnode_setup() {
   refuse_both_roles portainer-node
   record_role node
-  ensure_private_ip
+  ensure_private_ip node
   log "Portainer agent"
   configure_agent_access
   configure_agent_secret keep
@@ -862,8 +815,9 @@ pnode_checks() {
   fi
   local answer
   check_private_network
+  wg_check
   check_container node
-  check_port_sources "${PORTAINER_AGENT_PORT}" "Portainer agent access" "$(config_get SERVER_IP)"
+  wg_check_port_sources "${PORTAINER_AGENT_PORT}" "Portainer agent access" "$(config_get SERVER_IP)"
   if [[ -z "$(config_get AGENT_SECRET "${PORTAINER_ENV}")" ]]; then
     record FAIL "Portainer agent secret" "none set: sudo portainerctl set-secret"
   fi

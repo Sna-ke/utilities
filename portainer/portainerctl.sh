@@ -186,7 +186,7 @@ restore() {
 restore_and_restart() {
   restore_server "$1"
   # shellcheck disable=SC2046 # one rule per address
-  set_port_sources "${PORTAINER_UI_PORT}" "Portainer UI" $(config_get ALLOWED_IPS)
+  wg_set_port_sources "${PORTAINER_UI_PORT}" "Portainer UI" $(config_get ALLOWED_IPS)
   ensure_container server
   wait_for_server || die "Portainer didn't start: sudo docker logs ${PORTAINER_SERVER_CONTAINER}"
   note "Portainer $(server_version)"
@@ -204,6 +204,7 @@ set_server() {
   [[ $# -le 1 ]] || die "usage: portainerctl set-server [server's private IP]"
   if (($# == 1)); then
     valid_ipv4 "$1" || die "'$1' isn't an IPv4 address"
+    [[ $1 == "${WG_SERVER_ADDRESS}" ]] || die "move the WireGuard tunnel first; set-server cannot change its peer address"
     PORTAINER_SERVER_IP="$1" audited_change configure_agent_access
   else
     audited_change configure_agent_access
@@ -251,7 +252,7 @@ status() {
     fi
     if [[ ${role} == "server" ]]; then
       printf 'Version\t%s\n' "$(server_version)"
-      printf 'Web UI\thttps://%s:%s\n' "$(public_address)" "${PORTAINER_UI_PORT}"
+      printf 'Web UI\thttps://%s:%s (WireGuard only)\n' "$(wg_private_ip)" "${PORTAINER_UI_PORT}"
       if [[ ${readable} == "yes" ]]; then printf 'UI lets in\t%s\n' "$(config_get ALLOWED_IPS)"; fi
       case "$(api_status /users/admin/check)" in
         204) printf 'Admin\t%s\n' "${PORTAINER_ADMIN}" ;;
@@ -287,7 +288,11 @@ remove_role() {
   local role="$1"
   if [[ ${role} == "server" && -d ${PORTAINER_DATA} ]]; then note "backup: $(backup_server "")"; fi
   docker rm -f "$(container_name "${role}")" >/dev/null 2>&1 || true
-  if [[ ${role} == "server" ]]; then close_port "${PORTAINER_UI_PORT}"; else close_port "${PORTAINER_AGENT_PORT}"; fi
+  if [[ ${role} == "server" ]]; then
+    wg_set_port_sources "${PORTAINER_UI_PORT}" "Portainer UI"
+  else
+    wg_set_port_sources "${PORTAINER_AGENT_PORT}" "Portainer agent"
+  fi
   unregister_components "portainer-${role}"
   rm -f /usr/local/bin/portainerctl "${PORTAINER_ROLE_FILE}"
   # This script runs from that folder; bash keeps reading the open file.
@@ -308,25 +313,9 @@ remove() {
   log "Removing the Portainer ${role}"
   audited_change remove_role "${role}"
   note "kept: ${CONFIG_DIR}/portainer.*$([[ ${role} == server ]] && echo ", ${PORTAINER_DATA} and ${PORTAINER_BACKUP_DIR}")"
-  release_private_ip
+  note "WireGuard remains configured for reuse; revoke peers with networkctl as needed."
 }
 
-# Offers to take the private address off this VM (setup's netplan file only), so another VM can have it.
-release_private_ip() {
-  local address prefix interface
-  address="$(config_get PRIVATE_IP)"
-  prefix="$(config_get PRIVATE_PREFIX)"
-  [[ -n ${address} && -f ${PORTAINER_NETPLAN} ]] || return 0
-  if ! confirm "Release the private address ${address} too (to give it to another VM)?"; then
-    note "kept the private address ${address}"
-    return
-  fi
-  interface="$(ip -o -4 addr show | interface_with_address "${address}")"
-  rm -f "${PORTAINER_NETPLAN}"
-  if [[ -n ${interface} ]]; then ip addr del "${address}/${prefix}" dev "${interface}"; fi
-  netplan apply
-  note "released ${address}"
-}
 
 # ---------------------------------------------------------------------------------------------
 # help and dispatch

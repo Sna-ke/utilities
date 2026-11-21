@@ -25,7 +25,7 @@
 # The version of every script in host/ and the component folders. Every pull request that changes one
 # raises it and adds a line to host/CHANGELOG.md; CI checks both (github-runner/tests/version-check.sh).
 # shellcheck disable=SC2034 # read by the scripts that source this file
-TOOLS_VERSION="2.1.1"
+TOOLS_VERSION="2.2.0"
 # Where self-update and the installer get new versions.
 TOOLS_REPO="${TOOLS_REPO:-Sna-ke/utilities}"
 TOOLS_BRANCH="${TOOLS_BRANCH:-main}"
@@ -164,7 +164,10 @@ tool_folders() {
   local component
   {
     echo "host"
-    for component in "$@"; do component_field "${component}" folder; done
+    for component in "$@"; do
+      component_field "${component}" folder
+      case "${component}" in portainer-server|portainer-node) echo network ;; esac
+    done
   } | awk '!seen[$0]++'
 }
 
@@ -640,7 +643,8 @@ audit_setuid() {
 # hostctl's own files and command links, by hash: only setup should change them.
 audit_tools() {
   local file
-  for file in /usr/local/bin/hostctl /usr/local/bin/ghrunner /usr/local/bin/portainerctl "${TOOLS_DIR}"/*/*.sh; do
+  for file in /usr/local/bin/hostctl /usr/local/bin/ghrunner /usr/local/bin/portainerctl \
+    /usr/local/bin/networkctl "${TOOLS_DIR}"/*/*.sh; do
     if [[ -f ${file} ]]; then printf 'tools\t%s\t%s\n' "${file}" "$(git_blob_sha "${file}" | cut -c1-16)"; fi
   done
 }
@@ -663,6 +667,7 @@ audit_snapshot() {
     audit_users </etc/passwd || true
     audit_ssh_keys || true
     audit_files sudo /etc/sudoers /etc/sudoers.d/* || true
+    audit_files wireguard /etc/wireguard/wg0.conf /etc/wireguard/hostctl.key "${CONFIG_DIR}/wireguard.conf" || true
     audit_ssh_settings || true
     audit_firewall || true
     audit_listening || true
@@ -812,9 +817,12 @@ firewall_problems() {
       line = $0; sub(/ \(v6\)/, "", line); split(line, field, /  +/)
       target = field[1]; action = field[2]
       if (action !~ /^(ALLOW|LIMIT)/) next
-      port = target; sub(/\/.*/, "", port)
+      # ufw interface-scoped rules use targets like 9443/tcp on wg0.
+      # A dedicated component check validates the interface and sources.
+      base_target = target; sub(/ on .*/, "", base_target)
+      port = base_target; sub(/\/.*/, "", port)
       if (port == "OpenSSH") port = "22"
-      if (index(allowed, " " target " ") > 0) next
+      if (index(allowed, " " target " ") > 0 || index(allowed, " " base_target " ") > 0) next
       if (index(ssh_ports, " " port " ") == 0) { if (!(target in other)) { other[target] = 1; print "also lets in " target } }
       else if (action ~ /^ALLOW/ && !(target in unlimited)) { unlimited[target] = 1; print target " has no rate limit" }
     }'
