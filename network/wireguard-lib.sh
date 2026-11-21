@@ -56,6 +56,12 @@ wg_prepare() {
     (umask 077; wg genkey >"${WG_KEY_FILE}")
   fi
   chmod 0600 "${WG_KEY_FILE}"
+  # Docker's host-networked Portainer processes rely on a default-deny host firewall.
+  # hostctl has already installed and allow-listed SSH before calling component setup.
+  ufw --force enable >/dev/null
+  ufw default deny incoming >/dev/null
+  grep -q 'Default: deny (incoming)' <(ufw status verbose) ||
+    die "ufw incoming policy is not deny; refusing to run Portainer"
 }
 
 wg_public_key() {
@@ -126,6 +132,7 @@ wg_init_node() {
     [[ ${WG_PEER_ADDRESS} != "${WG_SERVER_ADDRESS}" ]] || die "node and server addresses must differ"
     wg_valid_endpoint "${WG_SERVER_ENDPOINT}" || die "invalid WG_SERVER_ENDPOINT (use public-ip:51820)"
     wg_valid_key "${WG_SERVER_PUBLIC_KEY}" || die "invalid WG_SERVER_PUBLIC_KEY"
+    wg_valid_ip "${WG_SERVER_ADDRESS}" || die "invalid WG_SERVER_ADDRESS"
     {
       printf '# Managed by hostctl; do not edit by hand.\n[Interface]\nAddress = %s/32\n' "${WG_PEER_ADDRESS}"
       printf 'PrivateKey = %s\n\n[Peer]\nPublicKey = %s\n' "$(<"${WG_KEY_FILE}")" "${WG_SERVER_PUBLIC_KEY}"
