@@ -99,7 +99,7 @@ check "WireGuard endpoint" "ok" "$(outcome wg_valid_endpoint 203.0.113.10:51820)
 check "WireGuard invalid endpoint" "fails" "$(outcome wg_valid_endpoint 'bad host:51820')"
 check "WireGuard key" "ok" "$(outcome wg_valid_key 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=')"
 check "WireGuard invalid key" "fails" "$(outcome wg_valid_key 'oops')"
-check "folder staging adds network dependency" $'host\\nnetwork\\nportainer' "$(tool_folders portainer-node)"
+check "folder staging adds network dependency" $'host\nportainer\nnetwork' "$(tool_folders portainer-node)"
 
 # ---------------------------------------------------------------------------------------------
 # Firewall rules
@@ -312,7 +312,7 @@ check "install: new server on fresh host" "portainer-server" "$(components_for_s
 printf 'github-runner\n' >"${COMPONENTS_FILE}"
 check "install: add server alongside registered runner" $'portainer-server\ngithub-runner' \
   "$(components_for_setup portainer-server)"
-check "install: all folders for runner and Portainer" $'host\nportainer\ngithub-runner' \
+check "install: all folders for runner and Portainer" $'host\nportainer\nnetwork\ngithub-runner' \
   "$(tool_folders portainer-server github-runner)"
 printf 'github-runner\nportainer-server\n' >"${COMPONENTS_FILE}"
 check "install: retry after interrupted setup deduplicates server" $'portainer-server\ngithub-runner' \
@@ -327,7 +327,7 @@ unset -f legacy_runner_present
 check "component fields" "portainer	portainer-lib.sh	pserver	pnode" \
   "$(printf '%s\t' "$(component_field portainer-server folder)" "$(component_field portainer-server library)" \
     "$(component_field portainer-server prefix)" "$(component_field portainer-node prefix)" | sed 's/\t$//')"
-check "folders for the runner VM with the server" $'host\ngithub-runner\nportainer' "$(tool_folders github-runner portainer-server)"
+check "folders for the runner VM with the server" $'host\ngithub-runner\nportainer\nnetwork' "$(tool_folders github-runner portainer-server)"
 mkdir -p "${CONFIG_DIR}"
 printf 'github-runner\nportainer-server\n' >"${COMPONENTS_FILE}"
 runner_prune_level() { echo full; } # runner-lib.sh isn't loaded here
