@@ -2,8 +2,10 @@
 # Inspect and maintain the private WireGuard overlay. Never prints private keys.
 set -Eeuo pipefail
 NET_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+# shellcheck disable=SC1091 # resolved from installed network directory
 # shellcheck source=../host/host-lib.sh
 . "${NET_DIR}/../host/host-lib.sh"
+# shellcheck disable=SC1091 # resolved from installed network directory
 # shellcheck source=wireguard-lib.sh
 . "${NET_DIR}/wireguard-lib.sh"
 trap 'die "line ${LINENO}: ${BASH_COMMAND} failed"' ERR
