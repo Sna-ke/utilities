@@ -19,6 +19,7 @@
 
 # Settings (root only): ALLOWED_IPS (server), SERVER_IP (node).
 # WireGuard is a reusable network module and owns private addressing and key material.
+# shellcheck disable=SC1091 # component is downloaded with network/ during setup
 # shellcheck source=../network/wireguard-lib.sh
 . "$(dirname "${BASH_SOURCE[0]}")/../network/wireguard-lib.sh"
 PORTAINER_CONFIG="${CONFIG_DIR}/portainer.conf"
@@ -568,7 +569,7 @@ refuse_both_roles() {
 
 # Doctor row: this VM has its private address.
 check_private_network() {
-  local address interface
+  local address
   address="$(config_get PRIVATE_IP)"
   if [[ -z ${address} ]]; then
     record FAIL "Private network" "no private address set" fix
