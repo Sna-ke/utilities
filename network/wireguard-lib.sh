@@ -114,8 +114,9 @@ wg_save_meta() {
 }
 
 wg_init_server() {
-  [[ ${WG_PORT} =~ ^[0-9]+$ ]] && ((10#${WG_PORT} >= 1 && 10#${WG_PORT} <= 65535)) ||
+  if [[ ! ${WG_PORT} =~ ^[0-9]+$ ]] || ((10#${WG_PORT} < 1 || 10#${WG_PORT} > 65535)); then
     die "WG_PORT must be a UDP port from 1 to 65535"
+  fi
   wg_prepare
   if [[ -f ${WG_FILE} ]]; then
     [[ $(wg_role) == server ]] || die "WireGuard is already configured for another role"
