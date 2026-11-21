@@ -35,12 +35,17 @@ wg_ip_number() {
 
 wg_overlay_ip() {
   wg_valid_ip "$1" || return 1
-  local network="${WG_SERVER_CIDR%/*}" prefix="${WG_SERVER_CIDR#*/}" mask
+  local network="${WG_SERVER_CIDR%/*}" prefix="${WG_SERVER_CIDR#*/}" mask address_num net_num hostmask
   wg_valid_ip "${network}" || return 1
   [[ ${prefix} =~ ^[0-9]+$ ]] || return 1
   ((10#${prefix} >= 8 && 10#${prefix} <= 30)) || return 1
   mask=$(( (0xffffffff << (32 - 10#${prefix})) & 0xffffffff ))
-  (( ($(wg_ip_number "$1") & mask) == ($(wg_ip_number "${network}") & mask) ))
+  address_num="$(wg_ip_number "$1")"
+  net_num="$(wg_ip_number "${network}")"
+  hostmask=$((0xffffffff ^ mask))
+  # Reject the subnet's network and broadcast addresses as peer identities.
+  (( (address_num & mask) == (net_num & mask) &&
+     (address_num & hostmask) != 0 && (address_num & hostmask) != hostmask ))
 }
 
 wg_valid_key() {
