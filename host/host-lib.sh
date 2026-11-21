@@ -25,7 +25,7 @@
 # The version of every script in host/ and the component folders. Every pull request that changes one
 # raises it and adds a line to host/CHANGELOG.md; CI checks both (github-runner/tests/version-check.sh).
 # shellcheck disable=SC2034 # read by the scripts that source this file
-TOOLS_VERSION="2.1.1"
+TOOLS_VERSION="2.2.0"
 # Where self-update and the installer get new versions.
 TOOLS_REPO="${TOOLS_REPO:-Sna-ke/utilities}"
 TOOLS_BRANCH="${TOOLS_BRANCH:-main}"
@@ -164,7 +164,10 @@ tool_folders() {
   local component
   {
     echo "host"
-    for component in "$@"; do component_field "${component}" folder; done
+    for component in "$@"; do
+      component_field "${component}" folder
+      case "${component}" in portainer-server|portainer-node) echo network ;; esac
+    done
   } | awk '!seen[$0]++'
 }
 
