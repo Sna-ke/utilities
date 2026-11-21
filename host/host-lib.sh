@@ -817,8 +817,8 @@ firewall_problems() {
       line = $0; sub(/ \(v6\)/, "", line); split(line, field, /  +/)
       target = field[1]; action = field[2]
       if (action !~ /^(ALLOW|LIMIT)/) next
-      # ufw interface-scoped rules use a target like '9443/tcp on wg0'.
-      # The component's dedicated check validates the interface and sources.
+      # ufw interface-scoped rules use targets like 9443/tcp on wg0.
+      # A dedicated component check validates the interface and sources.
       base_target = target; sub(/ on .*/, "", base_target)
       port = base_target; sub(/\/.*/, "", port)
       if (port == "OpenSSH") port = "22"
