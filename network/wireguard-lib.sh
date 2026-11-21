@@ -20,6 +20,7 @@ wg_field() {
 
 wg_valid_ip() {
   local address="$1" octet
+  local -a octets
   [[ ${address} =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
   IFS=. read -r -a octets <<<"${address}"
   for octet in "${octets[@]}"; do ((10#${octet} <= 255)) || return 1; done
@@ -179,7 +180,7 @@ wg_remove_peer() {
   [[ $# -eq 1 ]] && wg_valid_name "$1" || die "usage: networkctl remove-peer <name>"
   grep -Fqx "# Peer: $1" "${WG_FILE}" || die "peer not found"
   local tmp
-  tmp="$(mktemp)"
+  tmp="$(mktemp --suffix=.conf)"
   awk -v target="# Peer: $1" '
     /^# Peer: / { drop=($0==target) }
     !drop { print }
@@ -202,21 +203,65 @@ wg_check() {
   fi
 }
 
-# Authorize Portainer ports ONLY through the authenticated wg0 interface.
-wg_allow_port() {
-  local port="$1" source="$2" name="$3"
-  wg_valid_ip "${source}" || die "invalid WireGuard firewall source"
-  ufw allow in on "${WG_IFACE}" proto tcp from "${source}" to any port "${port}" comment "${name}" >/dev/null
+# List every ufw ALLOW rule for this port including any legacy public rules.
+wg_port_rules() {
+  local port="$1"
+  ufw status numbered | awk -v port="${port}" '
+    /^\\[ *[0-9]+\\]/ {
+      number=$1; gsub(/\\[/, "", number); gsub(/\\]/, "", number)
+      # ufw formats [ 1] as two fields and [10] as one; remove the bracket prefix first.
+      line=$0
+      sub(/^\\[ *[0-9]+\\][[:space:]]+/, "", line)
+      if (line ~ ("^" port "(/tcp)?([[:space:]]|$)") && line ~ /ALLOW/) {
+        print number "\\t" line
+      }
+    }'
 }
 
-wg_check_port() {
-  local port="$1" source="$2" name="$3"
-  # ufw status output must contain the private source and wg0 interface, never Anywhere.
-  local lines
-  lines="$(ufw status verbose)"
-  if grep -Eq "^${port}/tcp[[:space:]].*ALLOW IN[[:space:]]+${source}[[:space:]]+on ${WG_IFACE}" <<<"${lines}"; then
-    record PASS "${name}" "via ${WG_IFACE} from ${source}"
+# Replace all rules for this management port, including old public/vRack rules, with VPN-only
+# rules. Delete before adding to avoid a window when broad public access is still possible.
+wg_set_port_sources() {
+  local port="$1" comment="$2" number source
+  shift 2
+  local rules
+  rules="$(ufw status numbered | awk -v port="${port}" '
+    /^\\[ *[0-9]+\\]/ {
+      n=$0; sub(/^\\[/, "", n); sub(/\\].*$/, "", n); gsub(/ /, "", n)
+      line=$0; sub(/^\\[ *[0-9]+\\][[:space:]]+/, "", line)
+      if (line ~ ("^" port "(/tcp)?([[:space:]]|$)") && line ~ /ALLOW/) print n
+    }' | sort -rn)"
+  while IFS= read -r number; do
+    [[ -z ${number} ]] || ufw --force delete "${number}" >/dev/null
+  done <<<"${rules}"
+  for source in "$@"; do
+    wg_valid_ip "${source}" || die "expected an individual WireGuard IPv4 source, got '${source}'"
+    ufw allow in on "${WG_IFACE}" proto tcp from "${source}" to any port "${port}" comment "${comment}" >/dev/null
+  done
+}
+
+wg_check_port_sources() {
+  local port="$1" name="$2" expected="$3" source line actual=""
+  local matched=0 bad=0
+  local status
+  status="$(ufw status)"
+  while IFS= read -r line; do
+    [[ ${line} =~ ^${port}(/tcp)?[[:space:]] ]] || continue
+    [[ ${line} == *"ALLOW"* ]] || continue
+    if [[ ${line} == *" on ${WG_IFACE}"* && ${line} != *"Anywhere"* ]]; then
+      source="$(awk -F '  +' '{print $3}' <<<"${line}" | sed 's/[[:space:]]*#.*//')"
+      if [[ -n ${source} ]]; then
+        actual="${actual:+${actual} }${source}"
+        matched=$((matched+1))
+      else
+        bad=$((bad+1))
+      fi
+    else
+      bad=$((bad+1))
+    fi
+  done <<<"${status}"
+  if ((bad>0 || matched==0)) || [[ "$(tr ' ' '\\n' <<<"${expected}" | sort -u)" != "$(tr ' ' '\\n' <<<"${actual}" | sort -u)" ]]; then
+    record FAIL "${name}" "unsafe or incorrect TCP ${port} rules; require only ${expected} on ${WG_IFACE}" fix
   else
-    record FAIL "${name}" "expected only ${source} on ${WG_IFACE} for TCP ${port}" fix
+    record PASS "${name}" "only ${expected} on ${WG_IFACE}"
   fi
 }
