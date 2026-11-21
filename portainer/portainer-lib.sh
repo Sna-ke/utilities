@@ -615,6 +615,8 @@ configure_ui_access() {
   # Restrict the Portainer UI to administrator peers on the authenticated VPN only.
   # shellcheck disable=SC2086 # one rule per address
   wg_set_port_sources "${PORTAINER_UI_PORT}" "Portainer UI" ${allowed}
+  wg_check_port_sources "${PORTAINER_UI_PORT}" "Portainer UI" "${allowed}"
+  [[ ${DOCTOR_FAILED:-0} == 0 ]] || die "Portainer UI firewall isolation check failed"
   note "the web UI lets in over wg0: ${allowed}"
 }
 
@@ -741,6 +743,8 @@ configure_agent_access() {
   valid_ipv4 "${server}" || die "'${server}' isn't an IPv4 address"
   config_set SERVER_IP "${server}"
   wg_set_port_sources "${PORTAINER_AGENT_PORT}" "Portainer agent" "${server}"
+  wg_check_port_sources "${PORTAINER_AGENT_PORT}" "Portainer agent" "${server}"
+  [[ ${DOCTOR_FAILED:-0} == 0 ]] || die "Portainer agent firewall isolation check failed"
   note "the agent lets in only ${server}"
 }
 
