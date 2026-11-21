@@ -30,6 +30,9 @@ outcome() {
   if ("$@") >/dev/null 2>&1; then echo ok; else echo fails; fi
 }
 check "valid address" ok "$(outcome wg_valid_ip 10.70.0.2)"
+check "overlay address within /24" ok "$(outcome wg_overlay_ip 10.70.0.2)"
+check "overlay rejects unrelated address" fails "$(outcome wg_overlay_ip 10.71.0.2)"
+check "overlay rejects public address" fails "$(outcome wg_overlay_ip 8.8.8.8)"
 check "invalid address" fails "$(outcome wg_valid_ip 10.70.0.300)"
 check "invalid prefix string" fails "$(outcome wg_valid_ip 10.70.0.2/24)"
 check "peer name" ok "$(outcome wg_valid_name admin-mac)"
