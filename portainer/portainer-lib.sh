@@ -700,6 +700,7 @@ pserver_checks() {
   fi
   local exposed backup
   check_private_network
+  wg_check
   check_container server
   wg_check_port_sources "${PORTAINER_UI_PORT}" "Portainer UI access" "$(config_get ALLOWED_IPS)"
   exposed="$(ss -Htlnp 2>/dev/null | exposed_closed_ports | paste -sd' ' -)"
@@ -732,7 +733,9 @@ pserver_upgrade() {
 
 # hostctl hooks: production data never gets pruned; the UI port is Portainer's.
 pserver_prune_level() { echo "images"; }
-pserver_firewall_allowed() { echo "${PORTAINER_UI_PORT}/tcp"; }
+pserver_firewall_allowed() {
+  printf '%s\n' "${PORTAINER_UI_PORT}/tcp" "${WG_PORT}/udp"
+}
 
 # ---------------------------------------------------------------------------------------------
 # portainer-node hooks
@@ -812,6 +815,7 @@ pnode_checks() {
   fi
   local answer
   check_private_network
+  wg_check
   check_container node
   wg_check_port_sources "${PORTAINER_AGENT_PORT}" "Portainer agent access" "$(config_get SERVER_IP)"
   if [[ -z "$(config_get AGENT_SECRET "${PORTAINER_ENV}")" ]]; then
