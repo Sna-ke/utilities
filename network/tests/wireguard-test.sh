@@ -2,14 +2,17 @@
 # WireGuard overlay regression tests; no root, network, or WireGuard interface required.
 set -Eeuo pipefail
 TEST_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck disable=SC1091 # checkout-relative source used by the test
 # shellcheck source=../../host/host-lib.sh
 . "${TEST_DIR}/../../host/host-lib.sh"
+# shellcheck disable=SC1091 # checkout-relative source used by the test
 # shellcheck source=../wireguard-lib.sh
 . "${TEST_DIR}/../wireguard-lib.sh"
 SAMPLES="$(mktemp -d)"
 trap 'rm -rf "${SAMPLES}"' EXIT
 WG_DIR="${SAMPLES}/wireguard"
 WG_FILE="${WG_DIR}/wg0.conf"
+# shellcheck disable=SC2034 # accessed by sourced WireGuard library
 WG_KEY_FILE="${WG_DIR}/hostctl.key"
 WG_META="${SAMPLES}/meta"
 mkdir -p "${WG_DIR}"
@@ -58,11 +61,13 @@ STATUS='Status: active
 To                         Action      From
 --                         ------      ----
 9443/tcp on wg0             ALLOW IN    10.70.0.10'
+# shellcheck disable=SC2034 # accessed by sourced host-lib.sh
 DOCTOR_ROWS=()
 DOCTOR_FAILED=0
 wg_check_port_sources 9443 "UI" "10.70.0.10"
 check "VPN firewall rule passes" 0 "${DOCTOR_FAILED}"
 STATUS="${STATUS}"$'\n9443/tcp                   ALLOW IN    Anywhere'
+# shellcheck disable=SC2034 # accessed by sourced host-lib.sh
 DOCTOR_ROWS=()
 DOCTOR_FAILED=0
 wg_check_port_sources 9443 "UI" "10.70.0.10"
@@ -77,7 +82,7 @@ wg() {
 # shellcheck disable=SC2317,SC2329 # fake replaces a host command
 wg-quick() {
   if [[ $1 == strip ]]; then
-    [[ -f ${2:-} ]] && cat "$2" || cat "${WG_FILE}"
+    if [[ -f ${2:-} ]]; then cat "$2"; else cat "${WG_FILE}"; fi
   fi
 }
 # shellcheck disable=SC2317,SC2329 # fake key provided by test
