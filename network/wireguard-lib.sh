@@ -181,7 +181,9 @@ wg_add_peer() {
 
 wg_remove_peer() {
   [[ $(wg_role) == server ]] || die "remove-peer only runs on the server"
-  [[ $# -eq 1 ]] && wg_valid_name "$1" || die "usage: networkctl remove-peer <name>"
+  if [[ $# -ne 1 ]] || ! wg_valid_name "$1"; then
+    die "usage: networkctl remove-peer <name>"
+  fi
   grep -Fqx "# Peer: $1" "${WG_FILE}" || die "peer not found"
   local tmp
   tmp="$(mktemp --suffix=.conf)"
@@ -214,10 +216,12 @@ wg_set_port_sources() {
   shift 2
   local rules
   rules="$(ufw status numbered | awk -v port="${port}" '
-    /^\\[ *[0-9]+\\]/ {
-      n=$0; sub(/^\\[/, "", n); sub(/\\].*$/, "", n); gsub(/ /, "", n)
-      line=$0; sub(/^\\[ *[0-9]+\\][[:space:]]+/, "", line)
-      if (line ~ ("^" port "(/tcp)?([[:space:]]|$)") && line ~ /ALLOW/) print n
+    index($0, "[") == 1 && index($0, "]") > 0 {
+      close_pos=index($0, "]")
+      n=substr($0, 2, close_pos - 2); gsub(/ /, "", n)
+      line=substr($0, close_pos + 1); sub(/^[[:space:]]+/, "", line)
+      if ((index(line, port "/tcp ") == 1 || index(line, port " ") == 1) &&
+          index(line, "ALLOW") > 0) print n
     }' | sort -rn)"
   while IFS= read -r number; do
     [[ -z ${number} ]] || ufw --force delete "${number}" >/dev/null
