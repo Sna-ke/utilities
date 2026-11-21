@@ -16,83 +16,52 @@ this folder adds Portainer and `portainerctl`. A VM is either the server or a no
 | `portainerctl.sh` | The command, installed as `/usr/local/bin/portainerctl` on the server and on every node |
 | `tests/portainer-test.sh` | Tests the parsing and decisions against sample input |
 
-## How it fits together
+## Secure overlay on ordinary OVH VPS instances
 
-```
- your home IP ──HTTPS 9443──▶ server VM (public address)
-                                 │  Portainer server: UI and API
-                                 │  private network (OVH vRack), e.g. 10.0.0.1
-                                 ▼
-               ┌── agent 9001 on 10.0.0.2 ── node VM 1 (your apps)
-               └── agent 9001 on 10.0.0.3 ── node VM 2 (your apps)
-```
+**No vRack, private OVH network, or extra network card is needed.** The installer configures the
+self-managed WireGuard `wg0` interface over each VPS's existing public IP connection.
 
-| Who | Can reach | Because |
-| --- | --- | --- |
-| The addresses you allow (your home IP) | The web UI, HTTPS on port 9443 | ufw lets in only them; plain HTTP is off |
-| Anyone else | Nothing of Portainer's | The UI port is closed to them; the Edge tunnel (8000) listens on loopback only |
-| The server's private address | Each node's agent, port 9001 | The agent listens on the node's private address only, and ufw lets in only the server |
-| Anything else on the private network | No agent | Same: ufw on each node |
+- Server listens on UDP 51820 and exposes the Portainer UI on TCP 9443 **only to registered administrator
+  WireGuard peers** (default administrator VPN address `10.70.0.10`).
+- Every node creates its own WireGuard key pair. Portainer agent 9001 is authorized on `wg0` only
+  from the server (default VPN address `10.70.0.1`).
+- Node installation stops before starting Portainer until the server has enrolled the node and a real
+  authenticated WireGuard handshake succeeds.
+- All keys remain on their owning host. Enrollment needs a trusted exchange of **public keys** over
+  your existing administrative SSH connection.
 
-Both containers use the host's network instead of published ports, because Docker's published ports bypass ufw.
+### Install server
 
-## Before you install
-
-1. In the OVH control panel, put the server VM and every node in the same vRack (private network).
-2. Choose a private address for each, in one range. For example:
-
-   | VM | Private address |
-   | --- | --- |
-   | Server | `10.0.0.1/24` |
-   | Node 1 | `10.0.0.2/24` |
-   | Node 2 | `10.0.0.3/24` |
-
-3. Know your home IP (setup suggests the address you're logged in from).
-
-Setup gives each VM its private address if no network card has it yet: it writes
-`/etc/netplan/60-hostctl-private.yaml` for the card with no address (asking which, if there are several) and runs
-`netplan apply`. If the card already has the address (OVH's DHCP, or you set it), nothing changes.
-
-## Install the server (control plane)
-
-On the server VM, as your admin user:
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/Sna-ke/utilities/main/host/install.sh | sudo bash -s -- portainer-server
+```bash
+curl -fsSL https://raw.githubusercontent.com/Sna-ke/utilities/feature/wireguard-vps-management/host/install.sh |
+  sudo TOOLS_BRANCH=feature/wireguard-vps-management bash -s -- portainer-server
 ```
 
-On the GitHub runner VM this adds Portainer next to the runners; the host steps run again and change nothing.
+The command prints the server public key and initializes WireGuard. To access the UI, enroll a WireGuard
+client on your laptop at `10.70.0.10` using `sudo networkctl add-peer admin-mac 10.70.0.10 <laptop-public-key>`,
+then open `https://10.70.0.1:9443` over the tunnel. There is **no public UI access** by default.
 
-| Question | Answer |
-| --- | --- |
-| The host's (SSH port, Pushover) | See the [host tools](../host/README.md#install) |
-| This VM's private (vRack) address | e.g. `10.0.0.1/24` |
-| Addresses that may open the web UI | Your home IP, e.g. `203.0.113.7` (Enter takes the address you're logged in from). Several: separate with spaces |
-| New Portainer password for admin | At least 12 characters, twice. Never stored by these scripts |
+### Install node (two-stage, securely enrolled)
 
-At the end it prints the UI's address (`https://<server's public IP>:9443`) and its certificate's SHA-256
-fingerprint. The certificate is Portainer's own, self-signed: the browser warns the first time, so check the
-fingerprint it shows matches, then accept it.
+Run the same one-line installer with `portainer-node` on the node. It prints a new node public key
+and stops until the server enrolls that key. On the server:
 
-## Install a node
+```bash
+sudo networkctl add-peer groundcore 10.70.0.2 <node-public-key>
+sudo networkctl public-key
+```
 
-1. On the server, print the agent secret: `sudo portainerctl secret`.
-2. On the node VM:
+Now rerun the node installer with `WG_PEER_ADDRESS=10.70.0.2`,
+`WG_SERVER_ENDPOINT=<server-public-ip>:51820`, and `WG_SERVER_PUBLIC_KEY=<server-public-key>`
+in the **sudo environment**. See [network/README.md](../network/README.md) for the exact example and security
+details. Afterwards, on the server:
 
-   ```sh
-   curl -fsSL https://raw.githubusercontent.com/Sna-ke/utilities/main/host/install.sh | sudo bash -s -- portainer-node
-   ```
+```bash
+sudo portainerctl add-node groundcore 10.70.0.2
+```
 
-   | Question | Answer |
-   | --- | --- |
-   | The host's (SSH port, Pushover) | See the [host tools](../host/README.md#install) |
-   | This VM's private (vRack) address | e.g. `10.0.0.2/24` |
-   | The Portainer server's private address | e.g. `10.0.0.1` |
-   | Agent secret | Paste it from step 1 (hidden) |
-
-3. On the server, add it (asks for the admin password): `sudo portainerctl add-node vps-app-1 10.0.0.2`.
-
-`portainerctl nodes` on the server lists them and whether each is up. Repeat for each new node.
+Node addresses must be unique. The WireGuard tunnel remains available when Portainer is removed, allowing
+other utilities to reuse it.
 
 ## `portainerctl`
 
