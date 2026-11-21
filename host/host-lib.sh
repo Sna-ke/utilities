@@ -817,9 +817,12 @@ firewall_problems() {
       line = $0; sub(/ \(v6\)/, "", line); split(line, field, /  +/)
       target = field[1]; action = field[2]
       if (action !~ /^(ALLOW|LIMIT)/) next
-      port = target; sub(/\/.*/, "", port)
+      # ufw interface-scoped rules use a target like '9443/tcp on wg0'.
+      # The component's dedicated check validates the interface and sources.
+      base_target = target; sub(/ on .*/, "", base_target)
+      port = base_target; sub(/\/.*/, "", port)
       if (port == "OpenSSH") port = "22"
-      if (index(allowed, " " target " ") > 0) next
+      if (index(allowed, " " target " ") > 0 || index(allowed, " " base_target " ") > 0) next
       if (index(ssh_ports, " " port " ") == 0) { if (!(target in other)) { other[target] = 1; print "also lets in " target } }
       else if (action ~ /^ALLOW/ && !(target in unlimited)) { unlimited[target] = 1; print target " has no rate limit" }
     }'
