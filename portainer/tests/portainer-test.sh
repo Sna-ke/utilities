@@ -88,28 +88,18 @@ check "secret: too short" "fails" "$(outcome valid_secret abc123)"
 check "secret: a quote" "fails" "$(outcome valid_secret "$(printf 'a%.0s' {1..40})\"")"
 
 # ---------------------------------------------------------------------------------------------
-# Network cards
+# WireGuard overlay (no OVH vRack card required)
 # ---------------------------------------------------------------------------------------------
 
-LINKS='1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 qdisc noqueue state UNKNOWN mode DEFAULT
-2: ens3: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc fq_codel state UP mode DEFAULT
-3: ens4: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc fq_codel state UP mode DEFAULT
-4: docker0: <NO-CARRIER,BROADCAST,MULTICAST,UP> mtu 1500 qdisc noqueue state DOWN mode DEFAULT
-5: veth12ab@if4: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc noqueue master docker0 state UP'
-ADDRESSES='1: lo    inet 127.0.0.1/8 scope host lo\       valid_lft forever preferred_lft forever
-2: ens3    inet 198.51.100.20/32 metric 100 scope global dynamic ens3\       valid_lft 85000sec preferred_lft 85000sec
-4: docker0    inet 172.17.0.1/16 brd 172.17.255.255 scope global docker0\       valid_lft forever preferred_lft forever'
-check "free cards: the vRack one" "ens4" "$(unaddressed_interfaces "${LINKS}" "${ADDRESSES}")"
-check "card with an address" "ens3" "$(interface_with_address 198.51.100.20 <<<"${ADDRESSES}")"
-check "no card with an address" "" "$(interface_with_address 10.0.0.1 <<<"${ADDRESSES}")"
-check "no partial address match" "" "$(interface_with_address 198.51.100.2 <<<"${ADDRESSES}")"
-check "netplan file" "# Written by hostctl (Portainer): this VM's private (vRack) address.
-network:
-  version: 2
-  ethernets:
-    ens4:
-      dhcp4: false
-      addresses: [10.0.0.2/24]" "$(netplan_private ens4 10.0.0.2/24)"
+check "WireGuard name" "ok" "$(outcome wg_valid_name groundcore-1)"
+check "WireGuard name rejects shell syntax" "fails" "$(outcome wg_valid_name '../bad')"
+check "WireGuard peer IPv4" "ok" "$(outcome wg_valid_ip 10.70.0.2)"
+check "WireGuard invalid peer IPv4" "fails" "$(outcome wg_valid_ip 10.70.0.256)"
+check "WireGuard endpoint" "ok" "$(outcome wg_valid_endpoint 203.0.113.10:51820)"
+check "WireGuard invalid endpoint" "fails" "$(outcome wg_valid_endpoint 'bad host:51820')"
+check "WireGuard key" "ok" "$(outcome wg_valid_key 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=')"
+check "WireGuard invalid key" "fails" "$(outcome wg_valid_key 'oops')"
+check "folder staging adds network dependency" $'host\\nnetwork\\nportainer' "$(tool_folders portainer-node)"
 
 # ---------------------------------------------------------------------------------------------
 # Firewall rules
