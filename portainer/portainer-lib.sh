@@ -187,6 +187,11 @@ public_address() {
 # ---------------------------------------------------------------------------------------------
 
 ensure_private_ip() {
+  # Refuse an in-place replacement of the old OVH vRack NIC configuration: it may
+  # still be carrying management traffic and needs a coordinated migration.
+  if [[ -f /etc/netplan/60-hostctl-private.yaml ]]; then
+    die "legacy vRack netplan configuration detected; migrate the existing Portainer host separately (network/README.md)"
+  fi
   if [[ "${1:-}" == server ]]; then wg_init_server; else wg_init_node; fi
   wg_available || die "WireGuard tunnel is not ready; refusing to start Portainer"
   config_set PRIVATE_IP "$(wg_private_ip)"
