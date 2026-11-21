@@ -643,7 +643,8 @@ audit_setuid() {
 # hostctl's own files and command links, by hash: only setup should change them.
 audit_tools() {
   local file
-  for file in /usr/local/bin/hostctl /usr/local/bin/ghrunner /usr/local/bin/portainerctl "${TOOLS_DIR}"/*/*.sh; do
+  for file in /usr/local/bin/hostctl /usr/local/bin/ghrunner /usr/local/bin/portainerctl \
+    /usr/local/bin/networkctl "${TOOLS_DIR}"/*/*.sh; do
     if [[ -f ${file} ]]; then printf 'tools\t%s\t%s\n' "${file}" "$(git_blob_sha "${file}" | cut -c1-16)"; fi
   done
 }
@@ -666,6 +667,7 @@ audit_snapshot() {
     audit_users </etc/passwd || true
     audit_ssh_keys || true
     audit_files sudo /etc/sudoers /etc/sudoers.d/* || true
+    audit_files wireguard /etc/wireguard/wg0.conf /etc/wireguard/hostctl.key "${CONFIG_DIR}/wireguard.conf" || true
     audit_ssh_settings || true
     audit_firewall || true
     audit_listening || true
