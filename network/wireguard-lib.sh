@@ -47,7 +47,7 @@ wg_managed() {
 
 wg_prepare() {
   command -v apt-get >/dev/null || die "WireGuard requires an Ubuntu host"
-  DEBIAN_FRONTEND=noninteractive apt-get install -yq wireguard-tools iproute2 >/dev/null
+  DEBIAN_FRONTEND=noninteractive apt-get install -yq wireguard-tools iproute2 iputils-ping >/dev/null
   install -d -m 0700 "${WG_DIR}" "${CONFIG_DIR}"
   if [[ -f ${WG_FILE} ]] && ! wg_managed; then
     die "${WG_FILE} exists but was not created by hostctl; refusing to overwrite it"
@@ -138,6 +138,8 @@ wg_init_node() {
   # A configured interface is not enough: require a genuine, recent authenticated handshake.
   local handshake tries
   for ((tries=0;tries<10;tries++)); do
+    # Send traffic to initiate the first tunnel handshake; an idle tunnel has none.
+    ping -n -c 1 -W 1 "${WG_SERVER_ADDRESS}" >/dev/null 2>&1 || true
     handshake="$(wg show "${WG_IFACE}" latest-handshakes | awk 'NR==1 { print $2 }')"
     if [[ ${handshake} =~ ^[0-9]+$ ]] && ((handshake > 0 && $(date +%s) - handshake < 180)); then
       note "WireGuard node $(wg_private_ip): authenticated tunnel established"
@@ -156,7 +158,9 @@ wg_add_peer() {
   wg_valid_ip "${address}" || die "invalid peer address"
   wg_valid_key "${key}" || die "invalid WireGuard public key"
   [[ ${address} != "$(wg_private_ip)" ]] || die "peer address conflicts with server"
-  if grep -Eq "^# Peer: ${name}$|^AllowedIPs = ${address}/32$|^PublicKey = ${key}$" "${WG_FILE}"; then
+  if grep -Fqx "# Peer: ${name}" "${WG_FILE}" ||
+    grep -Fqx "AllowedIPs = ${address}/32" "${WG_FILE}" ||
+    grep -Fqx "PublicKey = ${key}" "${WG_FILE}"; then
     die "peer name, address or key already registered"
   fi
   local backup
@@ -201,21 +205,6 @@ wg_check() {
   else
     record FAIL "WireGuard" "private management tunnel unavailable" fix
   fi
-}
-
-# List every ufw ALLOW rule for this port including any legacy public rules.
-wg_port_rules() {
-  local port="$1"
-  ufw status numbered | awk -v port="${port}" '
-    /^\\[ *[0-9]+\\]/ {
-      number=$1; gsub(/\\[/, "", number); gsub(/\\]/, "", number)
-      # ufw formats [ 1] as two fields and [10] as one; remove the bracket prefix first.
-      line=$0
-      sub(/^\\[ *[0-9]+\\][[:space:]]+/, "", line)
-      if (line ~ ("^" port "(/tcp)?([[:space:]]|$)") && line ~ /ALLOW/) {
-        print number "\\t" line
-      }
-    }'
 }
 
 # Replace all rules for this management port, including old public/vRack rules, with VPN-only
