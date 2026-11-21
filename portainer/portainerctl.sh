@@ -204,6 +204,7 @@ set_server() {
   [[ $# -le 1 ]] || die "usage: portainerctl set-server [server's private IP]"
   if (($# == 1)); then
     valid_ipv4 "$1" || die "'$1' isn't an IPv4 address"
+    [[ $1 == "${WG_SERVER_ADDRESS}" ]] || die "move the WireGuard tunnel first; set-server cannot change its peer address"
     PORTAINER_SERVER_IP="$1" audited_change configure_agent_access
   else
     audited_change configure_agent_access
