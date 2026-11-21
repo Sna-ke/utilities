@@ -332,7 +332,9 @@ mkdir -p "${CONFIG_DIR}"
 printf 'github-runner\nportainer-server\n' >"${COMPONENTS_FILE}"
 runner_prune_level() { echo full; } # runner-lib.sh isn't loaded here
 check "prune levels with the runner" $'full\nimages' "$(call_hooks prune_level)"
-check "ports the components open" "9443/tcp"check "role from the components" "server" "$(this_role)"
+check "ports the components open" "9443/tcp
+51820/udp" "$(call_hooks firewall_allowed)"
+check "role from the components" "server" "$(this_role)"
 printf 'portainer-node\n' >"${COMPONENTS_FILE}"
 check "node: prune images only" "images" "$(call_hooks prune_level)"
 check "node: agent port" "9001/tcp" "$(call_hooks firewall_allowed)"
