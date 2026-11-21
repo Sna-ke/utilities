@@ -26,6 +26,23 @@ wg_valid_ip() {
   for octet in "${octets[@]}"; do ((10#${octet} <= 255)) || return 1; done
 }
 
+# Represent an IPv4 address as an unsigned 32-bit integer, for overlay boundary checks.
+wg_ip_number() {
+  local a b c d
+  IFS=. read -r a b c d <<<"$1"
+  echo $(( (10#${a} << 24) | (10#${b} << 16) | (10#${c} << 8) | 10#${d} ))
+}
+
+wg_overlay_ip() {
+  wg_valid_ip "$1" || return 1
+  local network="${WG_SERVER_CIDR%/*}" prefix="${WG_SERVER_CIDR#*/}" mask
+  wg_valid_ip "${network}" || return 1
+  [[ ${prefix} =~ ^[0-9]+$ ]] || return 1
+  ((10#${prefix} >= 8 && 10#${prefix} <= 30)) || return 1
+  mask=$(( (0xffffffff << (32 - 10#${prefix})) & 0xffffffff ))
+  (( ($(wg_ip_number "$1") & mask) == ($(wg_ip_number "${network}") & mask) ))
+}
+
 wg_valid_key() {
   [[ $1 =~ ^[A-Za-z0-9+/]{43}=$ ]]
 }
@@ -97,6 +114,8 @@ wg_save_meta() {
 }
 
 wg_init_server() {
+  [[ ${WG_PORT} =~ ^[0-9]+$ ]] && ((10#${WG_PORT} >= 1 && 10#${WG_PORT} <= 65535)) ||
+    die "WG_PORT must be a UDP port from 1 to 65535"
   wg_prepare
   if [[ -f ${WG_FILE} ]]; then
     [[ $(wg_role) == server ]] || die "WireGuard is already configured for another role"
@@ -128,7 +147,7 @@ wg_init_node() {
     if [[ -z ${WG_PEER_ADDRESS} || -z ${WG_SERVER_ENDPOINT} || -z ${WG_SERVER_PUBLIC_KEY} ]]; then
       die "enroll this public key on the server with 'sudo networkctl add-peer <name> <address> <public-key>', then rerun with WG_PEER_ADDRESS, WG_SERVER_ENDPOINT and WG_SERVER_PUBLIC_KEY (see network/README.md)"
     fi
-    wg_valid_ip "${WG_PEER_ADDRESS}" || die "invalid WG_PEER_ADDRESS"
+    wg_overlay_ip "${WG_PEER_ADDRESS}" || die "WG_PEER_ADDRESS must be within ${WG_SERVER_CIDR}"
     [[ ${WG_PEER_ADDRESS} != "${WG_SERVER_ADDRESS}" ]] || die "node and server addresses must differ"
     wg_valid_endpoint "${WG_SERVER_ENDPOINT}" || die "invalid WG_SERVER_ENDPOINT (use public-ip:51820)"
     wg_valid_key "${WG_SERVER_PUBLIC_KEY}" || die "invalid WG_SERVER_PUBLIC_KEY"
@@ -162,7 +181,7 @@ wg_add_peer() {
   [[ $# -eq 3 ]] || die "usage: networkctl add-peer <name> <VPN-address> <public-key>"
   local name="$1" address="$2" key="$3"
   wg_valid_name "${name}" || die "invalid peer name"
-  wg_valid_ip "${address}" || die "invalid peer address"
+  wg_overlay_ip "${address}" || die "peer address must be within ${WG_SERVER_CIDR}"
   wg_valid_key "${key}" || die "invalid WireGuard public key"
   [[ ${address} != "$(wg_private_ip)" ]] || die "peer address conflicts with server"
   if grep -Fqx "# Peer: ${name}" "${WG_FILE}" ||
@@ -209,6 +228,11 @@ wg_remove_peer() {
 }
 
 wg_check() {
+  if ! grep -q 'Default: deny (incoming)' <(ufw status verbose); then
+    record FAIL "WireGuard firewall" "ufw incoming policy is not default-deny" fix
+  else
+    record PASS "WireGuard firewall" "default deny incoming"
+  fi
   if wg_available; then
     record PASS "WireGuard" "${WG_IFACE} $(wg_private_ip)"
   else
